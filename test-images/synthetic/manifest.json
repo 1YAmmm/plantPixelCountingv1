@@ -1,0 +1,44 @@
+{
+  "shape-known.jpg": {
+    "note": "One green ellipse with a known pixel count",
+    "leafPixels": 96776,
+    "stressedPixels": 0,
+    "coverPct": 9.68
+  },
+  "rosette-healthy.jpg": {
+    "note": "Healthy rosette framed in the square",
+    "leafPixels": 129030,
+    "stressedPixels": 0,
+    "coverPct": 12.9
+  },
+  "rosette-wilted.jpg": {
+    "note": "Leaves drooped: ~36% less leaf cover",
+    "leafPixels": 82570,
+    "stressedPixels": 0,
+    "coverPct": 8.26
+  },
+  "rosette-yellowing.jpg": {
+    "note": "Two outer leaves yellowed",
+    "leafPixels": 96070,
+    "stressedPixels": 32960,
+    "coverPct": 9.61
+  },
+  "rosette-warm-light.jpg": {
+    "note": "Warm colour cast, corrected from the white background",
+    "leafPixels": 129030,
+    "stressedPixels": 0,
+    "coverPct": 12.9
+  },
+  "rosette-blurry.jpg": {
+    "note": "Out of focus: rejected as blurry",
+    "leafPixels": 129030,
+    "stressedPixels": 0,
+    "coverPct": 12.9
+  },
+  "rosette-dark.jpg": {
+    "note": "Under-exposed: rejected as too dark",
+    "leafPixels": 129030,
+    "stressedPixels": 0,
+    "coverPct": 12.9
+  }
+}
