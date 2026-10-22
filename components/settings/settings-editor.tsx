@@ -11,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { canvasToRgb, drawScaled, fileToSquare, loadImage } from "@/lib/browser/image";
-import { baselineStore, thresholdStore, visionSettingsStore } from "@/lib/browser/store";
+import { cameraSourceStore, thresholdStore, useBaseline, visionSettingsStore } from "@/lib/browser/store";
 import { DEFAULT_DETECTION_SETTINGS, detectionSettingsSchema, type DetectionSettings } from "@/lib/detection/settings";
 import { formatNumber, formatPct } from "@/lib/format";
 import { previewAnalyze } from "@/lib/vision/preview";
@@ -110,7 +110,7 @@ function Section({ title, description, children }: { title: string; description?
 }
 
 function SamplePreview({ settings }: { settings: VisionSettings }) {
-  const { samples } = baselineStore.useValue();
+  const { samples } = useBaseline(cameraSourceStore.useValue());
   const [sample, setSample] = useState<HTMLCanvasElement | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);

@@ -16,27 +16,28 @@ import { useDeviceLevel, type DeviceLevel } from "./use-device-level";
 // framed in the square (pot rim on the circle) and a level shows when the phone is flat. Only the
 // square is captured. Native camera / file upload are the fallback (their centre square is used).
 
-const LIVE_EDGE = 320;
+export const LIVE_EDGE = 320;
 const LIVE_INTERVAL_MS = 350;
 
 type CameraState = "starting" | "live" | "unavailable";
 
-/** The square, pot circle, level bubble, ghost and live mask, positioned over the video. */
-function GuideOverlay({
+/** The square, pot circle, level bubble, ghost and live mask, positioned over the video (or a still photo). */
+export function GuideOverlay({
   aspect,
   level,
   ghostUrl,
   maskRef,
-  showMask,
+  showMask = false,
 }: {
   aspect: number;
-  level: DeviceLevel;
+  /** Omitted for the ESP32-CAM, which has no tilt sensor. */
+  level?: DeviceLevel;
   ghostUrl?: string;
-  maskRef: React.RefObject<HTMLCanvasElement | null>;
-  showMask: boolean;
+  maskRef?: React.RefObject<HTMLCanvasElement | null>;
+  showMask?: boolean;
 }) {
   const r = guideRect(aspect, 1);
-  const active = level.status === "active" && level.tiltDeg != null;
+  const active = level?.status === "active" && level.tiltDeg != null;
   const flat = active && level.tiltDeg! <= LEVEL_TOLERANCE_DEG;
   const pot = `${POT_CIRCLE_FRACTION * 100}%`;
 
@@ -49,7 +50,7 @@ function GuideOverlay({
       style={{ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.width * 100}%`, height: `${r.height * 100}%` }}
     >
       {ghostUrl && <img src={ghostUrl} alt="" className="absolute inset-0 size-full rounded-sm object-cover opacity-30" />}
-      <canvas ref={maskRef} aria-hidden className={cn("absolute inset-0 size-full", !showMask && "hidden")} />
+      {maskRef && <canvas ref={maskRef} aria-hidden className={cn("absolute inset-0 size-full", !showMask && "hidden")} />}
       <div
         className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-dashed border-white/70"
         style={{ width: pot, height: pot }}
@@ -59,7 +60,7 @@ function GuideOverlay({
           <div className="absolute top-1/2 left-1/2 size-9 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80" />
           <div
             className={cn("absolute top-1/2 left-1/2 size-4 rounded-full shadow", flat ? "bg-healthy" : "bg-mild")}
-            style={{ transform: `translate(calc(-50% + ${level.x * 60}px), calc(-50% + ${level.y * 60}px))` }}
+            style={{ transform: `translate(calc(-50% + ${level!.x * 60}px), calc(-50% + ${level!.y * 60}px))` }}
           />
         </>
       )}

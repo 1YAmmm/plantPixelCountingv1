@@ -61,7 +61,7 @@ function createStore<T>(key: string, parse: (raw: unknown) => T, fallback: T) {
     return useSyncExternalStore(subscribe, read, () => fallback);
   }
 
-  return { read, write, useValue };
+  return { read, write, subscribe, useValue };
 }
 
 export const visionSettingsStore = createStore<VisionSettings>("plant-wilt:vision-settings", parseVisionSettings, DEFAULT_VISION_SETTINGS);
@@ -98,4 +98,18 @@ function parseBaseline(raw: unknown): BaselineState {
 
 const EMPTY_BASELINE: BaselineState = { samples: [] };
 
-export const baselineStore = createStore<BaselineState>("plant-wilt:baseline", parseBaseline, EMPTY_BASELINE);
+/** Which camera the Analyze page uses. */
+export type CameraSource = "phone" | "esp32";
+
+export const cameraSourceStore = createStore<CameraSource>("plant-wilt:camera-source", (raw) => (raw === "esp32" ? "esp32" : "phone"), "phone");
+
+/** Plan §6: one baseline per source. Phone and ESP32-CAM photos are framed differently, so they are not comparable. */
+export const baselineStores = {
+  phone: createStore<BaselineState>("plant-wilt:baseline", parseBaseline, EMPTY_BASELINE),
+  esp32: createStore<BaselineState>("plant-wilt:baseline:esp32", parseBaseline, EMPTY_BASELINE),
+} satisfies Record<CameraSource, unknown>;
+
+export function useBaseline(source: CameraSource): BaselineState {
+  const store = baselineStores[source];
+  return useSyncExternalStore(store.subscribe, store.read, () => EMPTY_BASELINE);
+}

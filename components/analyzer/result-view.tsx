@@ -9,7 +9,7 @@ import { DiscolorationNote } from "@/components/status-badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import type { AnalyzeResponse } from "@/lib/analyze-api";
-import { thresholdStore } from "@/lib/browser/store";
+import { thresholdStore, type CameraSource } from "@/lib/browser/store";
 import { hasDiscoloration } from "@/lib/detection/status";
 import { formatNumber, formatPct } from "@/lib/format";
 import type { NormRect } from "@/lib/vision/types";
@@ -25,12 +25,14 @@ const LEGEND = [
 
 export function ResultView({
   result,
+  source,
   tiltDeg,
   busy,
   onRecrop,
   onNew,
 }: {
   result: AnalyzeResponse;
+  source: CameraSource;
   tiltDeg: number | null;
   busy: boolean;
   onRecrop: (roi: NormRect | null) => Promise<boolean>;
@@ -136,11 +138,13 @@ export function ResultView({
           <Stat label="Stressed pixels" value={formatNumber(m.stressedPixels)} />
         </div>
 
-        <BaselineCard result={result} valid={valid} onNext={onNew} />
+        <BaselineCard result={result} source={source} valid={valid} onNext={onNew} />
 
         <details className="rounded-lg border bg-card px-4 py-3 text-sm">
           <summary className="cursor-pointer font-medium">Analysis details</summary>
           <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 tabular-nums">
+            <dt className="text-muted-foreground">Camera</dt>
+            <dd>{source === "esp32" ? "ESP32-CAM (Bluetooth)" : "Phone"}</dd>
             <dt className="text-muted-foreground">Image</dt>
             <dd>
               {result.width} × {result.height} px (guide square)
