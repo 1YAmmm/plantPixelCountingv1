@@ -58,7 +58,7 @@ export function renderOverlay(img: RgbImage, input: OverlayInput): Uint8Array {
 }
 
 /** Mask preview for the browser: RGBA with transparent background, for drawing over a photo. */
-export function renderMaskRgba(width: number, height: number, leaf: BinaryMask, stressed: BinaryMask | null): Uint8ClampedArray {
+export function renderMaskRgba(width: number, height: number, leaf: BinaryMask, stressed: BinaryMask | null): Uint8ClampedArray<ArrayBuffer> {
   const out = new Uint8ClampedArray(width * height * 4);
   for (let i = 0, o = 0; i < width * height; i++, o += 4) {
     const c = leaf[i] ? OVERLAY_COLORS.leaf : stressed && stressed[i] ? OVERLAY_COLORS.stressed : null;

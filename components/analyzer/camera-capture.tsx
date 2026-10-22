@@ -6,9 +6,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "cn";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { canvasToRgb, fileToSquare, videoToSquare } from "@/lib/browser/image";
+import { canvasToRgb, drawMask, fileToSquare, videoToSquare } from "@/lib/browser/image";
+import { previewRunner } from "@/lib/browser/preview-worker";
 import { guideRect, LEVEL_TOLERANCE_DEG, POT_CIRCLE_FRACTION } from "@/lib/vision/guide";
-import { liveMask } from "@/lib/vision/preview";
 import type { VisionSettings } from "@/lib/vision/settings";
 import { useDeviceLevel, type DeviceLevel } from "./use-device-level";
 
@@ -17,7 +17,8 @@ import { useDeviceLevel, type DeviceLevel } from "./use-device-level";
 // square is captured. Native camera / file upload are the fallback (their centre square is used).
 
 export const LIVE_EDGE = 320;
-const LIVE_INTERVAL_MS = 350;
+/** The mask is computed in a worker, so it can refresh this often without slowing the video. */
+const LIVE_INTERVAL_MS = 200;
 
 type CameraState = "starting" | "live" | "unavailable";
 
@@ -88,6 +89,7 @@ export function CameraCapture({
   const [showMask, setShowMask] = useState(false);
   const [showGhost, setShowGhost] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [liveMask] = useState(() => previewRunner("live"));
   const level = useDeviceLevel(state === "live");
   const flat = level.status === "active" && level.tiltDeg != null && level.tiltDeg <= LEVEL_TOLERANCE_DEG;
 
@@ -124,20 +126,21 @@ export function CameraCapture({
     };
   }, []);
 
-  // Live mask preview of the square, a few times per second.
+  // Live mask preview of the square, several times per second.
   useEffect(() => {
     if (state !== "live" || !showMask) return;
+    const frame = document.createElement("canvas");
+    let stopped = false;
     const timer = setInterval(() => {
       const video = videoRef.current;
-      const canvas = maskRef.current;
-      if (!video || !canvas || video.readyState < 2) return;
-      const frame = videoToSquare(video, LIVE_EDGE);
-      canvas.width = frame.width;
-      canvas.height = frame.height;
-      canvas.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(liveMask(canvasToRgb(frame), settings)), frame.width, frame.height), 0, 0);
+      if (!video || video.readyState < 2) return;
+      liveMask(canvasToRgb(videoToSquare(video, LIVE_EDGE, frame)), settings).then((mask) => mask && !stopped && drawMask(maskRef.current, mask));
     }, LIVE_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [state, settings, showMask]);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [state, settings, showMask, liveMask]);
 
   const capture = useCallback(() => {
     const video = videoRef.current;

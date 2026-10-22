@@ -71,15 +71,16 @@ export function Analyzer() {
   const [busy, setBusy] = useState(false);
   const ghostUrl = samples.at(-1)?.thumb;
 
+  // `image` is encoded after `busy` is set, so the button reacts at once and cannot be pressed twice.
   const analyze = useCallback(
-    async (image: Blob, opts: { source: CameraSource; prepared: boolean; roi: NormRect | null; tiltDeg: number | null }) => {
-      const form = new FormData();
-      form.set("image", image, "photo.jpg");
-      form.set("settings", JSON.stringify(settings));
-      form.set("prepared", String(opts.prepared));
-      if (opts.roi) form.set("roi", JSON.stringify(opts.roi));
+    async (image: () => Promise<Blob>, opts: { source: CameraSource; prepared: boolean; roi: NormRect | null; tiltDeg: number | null }) => {
       setBusy(true);
       try {
+        const form = new FormData();
+        form.set("image", await image(), "photo.jpg");
+        form.set("settings", JSON.stringify(settings));
+        form.set("prepared", String(opts.prepared));
+        if (opts.roi) form.set("roi", JSON.stringify(opts.roi));
         const res = await fetch("/api/analyze", { method: "POST", body: form });
         const body = (await res.json()) as AnalyzeResponse | AnalyzeError;
         if (!res.ok || "error" in body) throw new Error("error" in body ? body.error : `Analysis failed (${res.status})`);
@@ -123,7 +124,7 @@ export function Analyzer() {
           settings={settings}
           analyzing={busy}
           onRetake={() => setStep({ name: "capture" })}
-          onAnalyze={async () => analyze(await canvasToBlob(step.photo), { source: step.source, prepared: false, roi: null, tiltDeg: step.tiltDeg })}
+          onAnalyze={() => analyze(() => canvasToBlob(step.photo), { source: step.source, prepared: false, roi: null, tiltDeg: step.tiltDeg })}
         />
       )}
 
@@ -134,9 +135,7 @@ export function Analyzer() {
           tiltDeg={step.tiltDeg}
           busy={busy}
           onNew={() => setStep({ name: "capture" })}
-          onRecrop={async (roi) =>
-            analyze(await dataUrlToBlob(step.result.imageDataUrl), { source: step.source, prepared: true, roi, tiltDeg: step.tiltDeg })
-          }
+          onRecrop={(roi) => analyze(() => dataUrlToBlob(step.result.imageDataUrl), { source: step.source, prepared: true, roi, tiltDeg: step.tiltDeg })}
         />
       )}
     </div>

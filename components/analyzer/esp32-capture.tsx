@@ -8,8 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { esp32Camera, type TransferProgress } from "@/lib/ble/esp32-camera";
 import { FRAME_SIZES, type FrameSize } from "@/lib/ble/protocol";
-import { canvasToRgb, cropToGuide, fileToSquare } from "@/lib/browser/image";
-import { liveMask } from "@/lib/vision/preview";
+import { canvasToRgb, cropToGuide, drawMask, fileToSquare } from "@/lib/browser/image";
+import { previewRunner } from "@/lib/browser/preview-worker";
 import type { VisionSettings } from "@/lib/vision/settings";
 import { GuideOverlay, LIVE_EDGE } from "./camera-capture";
 
@@ -53,6 +53,9 @@ export function Esp32Capture({
   const cam = useSyncExternalStore(esp32Camera.subscribe, esp32Camera.getSnapshot, esp32Camera.getServerSnapshot);
   const viewRef = useRef<HTMLCanvasElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
+  /** Reused for reading each live frame's guide square. */
+  const squareRef = useRef<HTMLCanvasElement>(null);
+  const [liveMask] = useState(() => previewRunner("live"));
   const [progress, setProgress] = useState<TransferProgress | null>(null);
   const [showMask, setShowMask] = useState(false);
   const [showGhost, setShowGhost] = useState(true);
@@ -76,7 +79,6 @@ export function Esp32Capture({
     createImageBitmap(frame.blob)
       .then((bitmap) => {
         const view = viewRef.current;
-        const mask = maskRef.current;
         if (!cancelled && view) {
           if (view.width !== bitmap.width || view.height !== bitmap.height) {
             view.width = bitmap.width;
@@ -84,11 +86,11 @@ export function Esp32Capture({
           }
           view.getContext("2d")!.drawImage(bitmap, 0, 0);
         }
-        if (!cancelled && showMask && mask) {
-          const square = cropToGuide(bitmap, bitmap.width, bitmap.height, LIVE_EDGE);
-          mask.width = square.width;
-          mask.height = square.height;
-          mask.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(liveMask(canvasToRgb(square), settings)), square.width, square.height), 0, 0);
+        if (!cancelled && showMask) {
+          squareRef.current ??= document.createElement("canvas");
+          const square = canvasToRgb(cropToGuide(bitmap, bitmap.width, bitmap.height, LIVE_EDGE, squareRef.current));
+          // Not tied to `cancelled`: the next frame often arrives before the mask is done, and drawing it late is fine.
+          liveMask(square, settings).then((mask) => mask && drawMask(maskRef.current, mask));
         }
         bitmap.close();
       })
@@ -96,7 +98,7 @@ export function Esp32Capture({
     return () => {
       cancelled = true;
     };
-  }, [frame, showMask, settings]);
+  }, [frame, showMask, settings, liveMask]);
 
   async function run(action: () => Promise<unknown>) {
     try {

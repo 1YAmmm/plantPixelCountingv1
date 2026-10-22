@@ -1,4 +1,5 @@
 import { guideRect, SQUARE_PX } from "../vision/guide";
+import type { MaskPreview } from "../vision/preview";
 import type { RgbImage } from "../vision/types";
 
 // Browser image helpers: plan §5 step 1 on the client (orientation, guide-square crop, resize).
@@ -18,13 +19,20 @@ export function drawScaled(source: CanvasImageSource, width: number, height: num
 /**
  * Crop the centred guide square of a width × height source and scale it to `size` × `size`.
  * Live captures and uploads both go through this, so every analyzed photo has the same framing.
+ * Pass `canvas` to reuse one between live frames. Its pixels are always read back (or encoded),
+ * so it is kept in CPU memory, where getImageData does not stall on the GPU.
  */
-export function cropToGuide(source: CanvasImageSource, width: number, height: number, size = SQUARE_PX): HTMLCanvasElement {
+export function cropToGuide(
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+  size = SQUARE_PX,
+  canvas = document.createElement("canvas"),
+): HTMLCanvasElement {
   const r = guideRect(width, height);
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
+  if (canvas.width !== size) canvas.width = size;
+  if (canvas.height !== size) canvas.height = size;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(source, r.x * width, r.y * height, r.width * width, r.height * height, 0, 0, size, size);
   return canvas;
@@ -40,8 +48,8 @@ export async function fileToSquare(file: Blob, size = SQUARE_PX): Promise<HTMLCa
   }
 }
 
-export function videoToSquare(video: HTMLVideoElement, size = SQUARE_PX): HTMLCanvasElement {
-  return cropToGuide(video, video.videoWidth, video.videoHeight, size);
+export function videoToSquare(video: HTMLVideoElement, size = SQUARE_PX, canvas?: HTMLCanvasElement): HTMLCanvasElement {
+  return cropToGuide(video, video.videoWidth, video.videoHeight, size, canvas);
 }
 
 export function canvasToBlob(canvas: HTMLCanvasElement, quality = 0.85): Promise<Blob> {
@@ -54,6 +62,14 @@ export function canvasToRgb(canvas: HTMLCanvasElement): RgbImage {
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
   return { width, height, data, channels: 4 };
+}
+
+/** Draw a mask preview into `canvas` (sized to match), for showing over the photo. */
+export function drawMask(canvas: HTMLCanvasElement | null, { maskRgba, width, height }: Pick<MaskPreview, "maskRgba" | "width" | "height">) {
+  if (!canvas) return;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  canvas.getContext("2d")!.putImageData(new ImageData(maskRgba, width, height), 0, 0);
 }
 
 export async function dataUrlToBlob(dataUrl: string): Promise<Blob> {

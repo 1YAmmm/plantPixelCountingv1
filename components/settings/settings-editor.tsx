@@ -2,7 +2,7 @@
 /* eslint-disable @next/next/no-img-element -- local sample photo */
 
 import { Download, ImageUp, RotateCcw, Save, Upload } from "lucide-react";
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,11 +10,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { canvasToRgb, drawScaled, fileToSquare, loadImage } from "@/lib/browser/image";
+import { canvasToRgb, drawMask, drawScaled, fileToSquare, loadImage } from "@/lib/browser/image";
+import { usePreviewJob } from "@/lib/browser/preview-worker";
 import { cameraSourceStore, thresholdStore, useBaseline, visionSettingsStore } from "@/lib/browser/store";
 import { DEFAULT_DETECTION_SETTINGS, detectionSettingsSchema, type DetectionSettings } from "@/lib/detection/settings";
 import { formatNumber, formatPct } from "@/lib/format";
-import { previewAnalyze } from "@/lib/vision/preview";
 import { DEFAULT_VISION_SETTINGS, visionSettingsSchema, type HsvRule, type VisionSettings } from "@/lib/vision/settings";
 
 // Plan §7.6, simplified: what counts as leaf and the wilting thresholds are always shown, with a
@@ -114,7 +114,6 @@ function SamplePreview({ settings }: { settings: VisionSettings }) {
   const [sample, setSample] = useState<HTMLCanvasElement | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
-  const deferred = useDeferredValue(settings);
   const ghost = samples.at(-1)?.thumb;
 
   // Use the latest baseline photo (already a guide square) as the sample until one is chosen.
@@ -130,14 +129,12 @@ function SamplePreview({ settings }: { settings: VisionSettings }) {
   }, [ghost, sample]);
 
   const sampleUrl = useMemo(() => sample?.toDataURL("image/jpeg", 0.85), [sample]);
-  const preview = useMemo(() => (sample ? previewAnalyze(canvasToRgb(sample), deferred) : null), [sample, deferred]);
+  const pixels = useMemo(() => (sample ? canvasToRgb(sample) : null), [sample]);
+  // Reruns in a worker on every slider move; the sliders never wait for it.
+  const preview = usePreviewJob("mask", pixels, settings);
 
   useEffect(() => {
-    const canvas = maskRef.current;
-    if (!canvas || !preview) return;
-    canvas.width = preview.width;
-    canvas.height = preview.height;
-    canvas.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(preview.maskRgba), preview.width, preview.height), 0, 0);
+    if (preview) drawMask(maskRef.current, preview);
   }, [preview]);
 
   return (
@@ -150,7 +147,7 @@ function SamplePreview({ settings }: { settings: VisionSettings }) {
         {sampleUrl ? (
           <div className="relative overflow-hidden rounded-lg border bg-muted">
             <img src={sampleUrl} alt="Sample photo" className="block w-full" />
-            <canvas ref={maskRef} aria-hidden className="absolute inset-0 size-full" />
+            <canvas ref={maskRef} aria-hidden className={preview ? "absolute inset-0 size-full" : "hidden"} />
           </div>
         ) : (
           <div className="flex aspect-square items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">No sample photo</div>

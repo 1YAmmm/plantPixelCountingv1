@@ -1,5 +1,4 @@
 "use client";
-/* eslint-disable @next/next/no-img-element -- local data URL of the captured photo */
 
 import { Check, Loader2, RotateCcw, ScanLine, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -7,14 +6,15 @@ import { Stat } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { canvasToRgb, drawScaled } from "@/lib/browser/image";
+import { canvasToRgb, drawMask, drawScaled } from "@/lib/browser/image";
+import { usePreviewJob } from "@/lib/browser/preview-worker";
 import { formatNumber, formatPct } from "@/lib/format";
 import { LEVEL_TOLERANCE_DEG } from "@/lib/vision/guide";
-import { previewAnalyze } from "@/lib/vision/preview";
 import type { VisionSettings } from "@/lib/vision/settings";
 
 // Plan §7.2 preview step: the square photo with its mask, an estimated leaf cover and quality
 // warnings, computed in the browser with the same rules as the server. Retake or analyze.
+// The photo shows at once; the checks run in a worker and fill in a moment later.
 
 const PREVIEW_EDGE = 500;
 
@@ -38,30 +38,27 @@ export function PreviewPanel({
   onRetake: () => void;
   onAnalyze: () => void;
 }) {
+  const photoRef = useRef<HTMLCanvasElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
   const [showMask, setShowMask] = useState(true);
-  const photoUrl = useMemo(() => photo.toDataURL("image/jpeg", 0.85), [photo]);
+  const pixels = useMemo(() => canvasToRgb(drawScaled(photo, photo.width, photo.height, PREVIEW_EDGE)), [photo]);
+  const preview = usePreviewJob("preview", pixels, settings);
 
-  const preview = useMemo(() => {
-    const small = drawScaled(photo, photo.width, photo.height, PREVIEW_EDGE);
-    return previewAnalyze(canvasToRgb(small), settings);
-  }, [photo, settings]);
-
-  const warnings = [...preview.issues.map((i) => i.message), tiltWarning(tiltDeg)].filter((w): w is string => !!w);
+  const warnings = [...(preview?.issues.map((i) => i.message) ?? []), tiltWarning(tiltDeg)].filter((w): w is string => !!w);
 
   useEffect(() => {
-    const canvas = maskRef.current;
-    if (!canvas) return;
-    canvas.width = preview.width;
-    canvas.height = preview.height;
-    canvas.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(preview.maskRgba), preview.width, preview.height), 0, 0);
+    photoRef.current?.getContext("2d")!.drawImage(photo, 0, 0);
+  }, [photo]);
+
+  useEffect(() => {
+    if (preview) drawMask(maskRef.current, preview);
   }, [preview]);
 
   return (
     <div className="space-y-4">
       <div className="relative mx-auto overflow-hidden rounded-xl border bg-muted" style={{ maxWidth: "62vh" }}>
-        <img src={photoUrl} alt="Captured photo (guide square)" className="block w-full" />
-        <canvas ref={maskRef} aria-hidden className={showMask ? "absolute inset-0 size-full" : "hidden"} />
+        <canvas ref={photoRef} width={photo.width} height={photo.height} role="img" aria-label="Captured photo (guide square)" className="block h-auto w-full" />
+        <canvas ref={maskRef} aria-hidden className={showMask && preview ? "absolute inset-0 size-full" : "hidden"} />
       </div>
 
       <label className="flex items-center gap-2 text-sm">
@@ -77,10 +74,10 @@ export function PreviewPanel({
       </label>
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Stat label="Estimated leaf cover" value={formatPct(preview.estimatedCoverPct)} hint="of the square, before cleanup" />
+        <Stat label="Estimated leaf cover" value={preview ? formatPct(preview.estimatedCoverPct) : "…"} hint="of the square, before cleanup" />
         <Stat label="Level" value={tiltDeg == null ? "—" : `${Math.round(tiltDeg)}°`} hint={tiltDeg == null ? "no tilt sensor" : `ok ≤ ${LEVEL_TOLERANCE_DEG}°`} />
-        <Stat label="Brightness" value={`${preview.brightnessPct.toFixed(0)}%`} hint={`ok ${settings.quality.minBrightness}–${settings.quality.maxBrightness}%`} />
-        <Stat label="Sharpness" value={formatNumber(preview.sharpness)} hint={`min ${settings.quality.minSharpness}`} />
+        <Stat label="Brightness" value={preview ? `${preview.brightnessPct.toFixed(0)}%` : "…"} hint={`ok ${settings.quality.minBrightness}–${settings.quality.maxBrightness}%`} />
+        <Stat label="Sharpness" value={preview ? formatNumber(preview.sharpness) : "…"} hint={`min ${settings.quality.minSharpness}`} />
       </div>
 
       {warnings.length > 0 ? (
@@ -95,11 +92,17 @@ export function PreviewPanel({
             </ul>
           </AlertDescription>
         </Alert>
-      ) : (
+      ) : preview ? (
         <Alert>
           <Check />
           <AlertTitle>Looks good</AlertTitle>
           <AlertDescription>Analyze it to get the official numbers after mask cleanup.</AlertDescription>
+        </Alert>
+      ) : (
+        <Alert>
+          <Loader2 className="animate-spin" />
+          <AlertTitle>Checking the photo…</AlertTitle>
+          <AlertDescription>Brightness, sharpness and an estimate of the leaf cover.</AlertDescription>
         </Alert>
       )}
 
