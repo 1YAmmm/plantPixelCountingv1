@@ -73,7 +73,7 @@ export function CropEditor({
       <div
         ref={boxRef}
         className="relative mx-auto touch-none overflow-hidden rounded-xl border select-none"
-        style={{ maxWidth: `calc(70vh * ${aspect})` }}
+        style={{ maxWidth: `calc(70svh * ${aspect})` }}
         onPointerMove={onPointerMove}
         onPointerUp={() => (drag.current = null)}
         onPointerCancel={() => (drag.current = null)}
@@ -90,7 +90,8 @@ export function CropEditor({
               key={h}
               data-handle={h}
               onPointerDown={onPointerDown}
-              className="absolute size-6 rounded-full border-2 border-white bg-primary"
+              // The ::after extends the grab area to 48 px for fingers.
+              className="absolute size-6 rounded-full border-2 border-white bg-primary after:absolute after:-inset-3"
               style={{
                 left: h.includes("w") ? -12 : undefined,
                 right: h.includes("e") ? -12 : undefined,

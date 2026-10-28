@@ -4,6 +4,7 @@ import { Bluetooth, BluetoothOff, BluetoothSearching, Camera, CameraOff, Layers,
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { cn } from "cn";
+import { ActionBar } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { esp32Camera, type TransferProgress } from "@/lib/ble/esp32-camera";
@@ -33,7 +34,7 @@ function errorMessage(e: unknown): string {
 
 function Placeholder({ icon: Icon, spin, children }: { icon: React.ElementType; spin?: boolean; children?: React.ReactNode }) {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center text-sm text-white/80">
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-sm text-white/80 sm:p-6">
       <Icon className={cn("size-8", spin && "animate-spin")} />
       {children}
     </div>
@@ -133,7 +134,7 @@ export function Esp32Capture({
     <div className="space-y-3">
       <div
         className="relative mx-auto w-full overflow-hidden rounded-xl border bg-black"
-        style={{ aspectRatio: aspect, maxWidth: `calc(62vh * ${aspect})` }}
+        style={{ aspectRatio: aspect, maxWidth: `calc(62svh * ${aspect})` }}
       >
         {connected && frame && (
           <>
@@ -209,13 +210,13 @@ export function Esp32Capture({
             <Switch checked={(cam.info?.led ?? 0) > 0} disabled={cam.busy} onCheckedChange={(on) => run(() => esp32Camera.setLed(on ? LED_LEVEL : 0))} />
             <Lightbulb className="size-4 text-muted-foreground" /> LED light
           </label>
-          <label className="flex items-center gap-2">
-            Photo size
+          <label className="flex w-full items-center gap-2 sm:w-auto">
+            <span className="shrink-0">Photo size</span>
             <select
               value={cam.info?.frame ?? ""}
               disabled={cam.busy}
               onChange={(e) => run(() => esp32Camera.setFrame(e.target.value as FrameSize))}
-              className="h-9 rounded-lg border border-input bg-transparent px-2.5 text-sm disabled:opacity-50 dark:bg-input/30"
+              className="h-9 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-2.5 text-base disabled:opacity-50 sm:flex-none md:text-sm dark:bg-input/30 pointer-coarse:h-11"
             >
               {cam.info?.frame == null && <option value="">Unknown</option>}
               {FRAME_SIZES.map((f) => (
@@ -230,7 +231,7 @@ export function Esp32Capture({
       )}
 
       {cam.supported && (
-        <div className="grid grid-cols-2 gap-2 sm:flex">
+        <ActionBar>
           {!connected && (
             <>
               <Button
@@ -259,7 +260,7 @@ export function Esp32Capture({
               </Button>
             </>
           )}
-        </div>
+        </ActionBar>
       )}
     </div>
   );

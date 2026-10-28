@@ -2,7 +2,7 @@
 
 import { Check, Loader2, RotateCcw, ScanLine, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Stat } from "@/components/page-header";
+import { ActionBar, Stat } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -56,14 +56,14 @@ export function PreviewPanel({
 
   return (
     <div className="space-y-4">
-      <div className="relative mx-auto overflow-hidden rounded-xl border bg-muted" style={{ maxWidth: "62vh" }}>
+      <div className="relative mx-auto overflow-hidden rounded-xl border bg-muted" style={{ maxWidth: "62svh" }}>
         <canvas ref={photoRef} width={photo.width} height={photo.height} role="img" aria-label="Captured photo (guide square)" className="block h-auto w-full" />
         <canvas ref={maskRef} aria-hidden className={showMask && preview ? "absolute inset-0 size-full" : "hidden"} />
       </div>
 
-      <label className="flex items-center gap-2 text-sm">
+      <label className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
         <Switch checked={showMask} onCheckedChange={setShowMask} /> Show mask preview
-        <span className="ml-1 flex items-center gap-3 text-xs text-muted-foreground">
+        <span className="flex items-center gap-3 text-xs text-muted-foreground sm:ml-1">
           <span className="flex items-center gap-1">
             <span className="size-2.5 rounded-sm bg-[#22c55e]" /> leaf
           </span>
@@ -106,7 +106,7 @@ export function PreviewPanel({
         </Alert>
       )}
 
-      <div className="grid grid-cols-2 gap-2 sm:flex">
+      <ActionBar>
         <Button variant="outline" size="lg" onClick={onRetake} disabled={analyzing}>
           <RotateCcw /> Retake
         </Button>
@@ -114,7 +114,7 @@ export function PreviewPanel({
           {analyzing ? <Loader2 className="animate-spin" /> : <ScanLine />}
           {analyzing ? "Analyzing…" : "Analyze"}
         </Button>
-      </div>
+      </ActionBar>
     </div>
   );
 }

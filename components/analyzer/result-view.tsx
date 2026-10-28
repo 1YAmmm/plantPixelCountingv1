@@ -46,7 +46,7 @@ export function ResultView({
   const valid = problems.length === 0;
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <div className="space-y-3">
         {cropping ? (
           <CropEditor
@@ -61,14 +61,17 @@ export function ResultView({
           />
         ) : (
           <>
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex gap-1 rounded-lg bg-muted p-1 text-sm">
                 {(["overlay", "original"] as const).map((v) => (
                   <button
                     key={v}
                     type="button"
                     onClick={() => setView(v)}
-                    className={cn("rounded-md px-3 py-1 capitalize text-muted-foreground", view === v && "bg-background font-medium text-foreground shadow-sm")}
+                    className={cn(
+                      "rounded-md px-3 py-1 capitalize text-muted-foreground pointer-coarse:py-2",
+                      view === v && "bg-background font-medium text-foreground shadow-sm",
+                    )}
                   >
                     {v}
                   </button>
@@ -87,7 +90,7 @@ export function ResultView({
             </div>
             <div
               className={cn("mx-auto overflow-hidden rounded-xl border bg-muted transition-opacity", busy && "opacity-50")}
-              style={{ maxWidth: `calc(70vh * ${result.width / result.height})` }}
+              style={{ maxWidth: `calc(70svh * ${result.width / result.height})` }}
             >
               <img src={view === "overlay" ? result.overlayDataUrl : result.imageDataUrl} alt={view === "overlay" ? "Analysis overlay" : "Analyzed photo"} className="block w-full" />
             </div>
@@ -126,8 +129,9 @@ export function ResultView({
           </Alert>
         )}
 
-        <div className="grid grid-cols-2 gap-2">
-          <div className="col-span-2">
+        {/* Side by side from 360 px: narrower tiles cannot fit the discoloration note. */}
+        <div className="grid grid-cols-1 gap-2 min-[360px]:grid-cols-2">
+          <div className="min-[360px]:col-span-2">
             <Stat large label="Leaf cover" value={formatPct(m.coveragePct)} hint={`of the guide square · ${formatNumber(m.leafPixels)} leaf pixels`} />
           </div>
           <Stat

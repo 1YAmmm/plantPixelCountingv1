@@ -4,6 +4,7 @@
 import { Camera, CameraOff, Compass, ImageUp, Layers, Loader2, ScanEye } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "cn";
+import { ActionBar } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { canvasToRgb, drawMask, fileToSquare, videoToSquare } from "@/lib/browser/image";
@@ -168,7 +169,7 @@ export function CameraCapture({
     <div className="space-y-3">
       <div
         className="relative mx-auto w-full overflow-hidden rounded-xl border bg-black"
-        style={{ aspectRatio: boxAspect, maxWidth: `calc(62vh * ${boxAspect})` }}
+        style={{ aspectRatio: boxAspect, maxWidth: `calc(62svh * ${boxAspect})` }}
       >
         <video ref={videoRef} playsInline muted className={cn("absolute inset-0 size-full object-contain", state !== "live" && "hidden")} />
         {state === "live" && <GuideOverlay aspect={aspect} level={level} ghostUrl={showGhost ? ghostUrl : undefined} maskRef={maskRef} showMask={showMask} />}
@@ -179,7 +180,7 @@ export function CameraCapture({
           </div>
         )}
         {state === "unavailable" && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center text-sm text-white/80">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center text-sm text-white/80 sm:p-6">
             <CameraOff className="size-8" />
             {error}
           </div>
@@ -225,7 +226,7 @@ export function CameraCapture({
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2 sm:flex">
+      <ActionBar>
         {state === "live" ? (
           <Button size="lg" className="col-span-2 sm:min-w-48" onClick={capture}>
             <Camera /> Capture
@@ -238,7 +239,7 @@ export function CameraCapture({
         <Button size="lg" variant="outline" onClick={() => fileRef.current?.click()} disabled={busy} className="col-span-2 sm:col-span-1">
           <ImageUp /> Upload photo
         </Button>
-      </div>
+      </ActionBar>
       <input ref={nativeRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onFile} />
       <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onFile} />
     </div>

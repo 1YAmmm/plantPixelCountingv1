@@ -52,7 +52,7 @@ function SourcePicker({ value, onChange }: { value: CameraSource; onChange: (sou
           aria-checked={value === v}
           onClick={() => onChange(v)}
           className={cn(
-            "flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-muted-foreground sm:flex-none",
+            "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1.5 whitespace-nowrap text-muted-foreground sm:flex-none sm:px-3 pointer-coarse:py-2.5",
             value === v && "bg-background font-medium text-foreground shadow-sm",
           )}
         >

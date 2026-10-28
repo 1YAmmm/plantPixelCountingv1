@@ -37,7 +37,7 @@ export function StatusBadge({ status, className, size = "md" }: { status: Status
 
 export function DiscolorationNote({ pct, className }: { pct: number; className?: string }) {
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded-full bg-stressed/15 px-2 py-0.5 text-xs font-medium text-stressed ring-1 ring-inset ring-stressed/30", className)}>
+    <span className={cn("inline-flex items-center gap-1 rounded-full bg-stressed/15 px-2 py-0.5 text-xs font-medium whitespace-nowrap text-stressed ring-1 ring-inset ring-stressed/30", className)}>
       <Droplets className="size-3.5" aria-hidden />
       Discoloration {pct.toFixed(0)}%
     </span>

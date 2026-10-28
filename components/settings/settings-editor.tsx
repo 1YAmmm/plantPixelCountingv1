@@ -49,7 +49,7 @@ function NumberField({
         <div className="flex items-center gap-1">
           <Input
             type="number"
-            className="h-7 w-20 text-right tabular-nums"
+            className="h-7 w-20 text-right tabular-nums pointer-coarse:h-9"
             value={value}
             min={min}
             max={max}
@@ -241,7 +241,7 @@ export function SettingsEditor() {
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <div className="order-2 space-y-6 lg:order-1">
         <Section title="Leaf (green)" description="Colours counted as leaf. Adjust if leaves are not green in the preview, or if the background is.">
           <div className="sm:col-span-2">
@@ -300,7 +300,7 @@ export function SettingsEditor() {
                 <select
                   value={v.plantRegion.mode}
                   onChange={(e) => setV("plantRegion", { ...v.plantRegion, mode: e.target.value as "hull" | "dilate" })}
-                  className="h-9 rounded-lg border border-input bg-transparent px-2.5 text-sm dark:bg-input/30"
+                  className="h-9 rounded-lg border border-input bg-transparent px-2.5 text-base md:text-sm dark:bg-input/30 pointer-coarse:h-11"
                 >
                   <option value="hull">Convex hull of the leaf mask</option>
                   <option value="dilate">Leaf mask grown by a radius</option>
