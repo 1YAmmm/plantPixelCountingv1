@@ -6,7 +6,8 @@
 //                      "wifi-ssid:<name>", "wifi-pass:<password>", "wifi:connect", "wifi:forget"
 //                      "tg-token:<bot token>", "tg-chat:<chat id>", "tg-label:<who gets the reports>"
 //                      "schedule:<days>,<HH:MM>,<UTC offset in minutes>"   days: bit 0 = Sunday … bit 6 = Saturday, 0 = off
-//                      "report"   take a photo, analyze it and send it to Telegram now
+//                      "schedule:every:<minutes>,<UTC offset in minutes>"   round the clock (firmware 3.3)
+//                      "report"   take the photos, analyze them and send the result to Telegram now
 //   Status  (notify) "ready" | "connecting" | "capturing" | "analyzing" | "sending" | "error:<message>"
 //   Info    (read)   JSON: firmware version, WiFi, Telegram and schedule (see parseInfo)
 // No DOM or Next.js dependencies, so it is tested directly.
@@ -22,6 +23,9 @@ export const DEVICE_NAME_PREFIX = "PlantCam";
 /** First firmware that sends Telegram reports by itself (older ones only join WiFi). */
 export const TELEGRAM_FIRMWARE = 3;
 
+/** First firmware with "every N minutes" schedules. */
+export const INTERVAL_FIRMWARE = "3.3";
+
 /** Longest command the firmware accepts (its Command.text buffer, minus the terminator). */
 export const MAX_COMMAND_LENGTH = 199;
 
@@ -35,6 +39,8 @@ export interface DeviceSchedule {
   time: string;
   /** Minutes east of UTC (Manila: 480). */
   utcOffset: number;
+  /** Instead of `time` on `days`: every this many minutes round the clock, from midnight. */
+  everyMinutes?: number;
 }
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -53,13 +59,20 @@ export const command = {
   telegramToken: (token: string) => `tg-token:${token}`,
   telegramChat: (chatId: number | string) => `tg-chat:${chatId}`,
   telegramLabel: (label: string) => `tg-label:${label}`,
-  schedule: ({ days, time, utcOffset }: DeviceSchedule) => `schedule:${daysMask(days)},${time},${Math.round(utcOffset)}`,
-  /** Photo, analysis and Telegram report now; answers "capturing", "analyzing", "sending", then "ready". */
+  schedule: ({ days, time, utcOffset, everyMinutes }: DeviceSchedule) =>
+    everyMinutes ? `schedule:every:${everyMinutes},${Math.round(utcOffset)}` : `schedule:${daysMask(days)},${time},${Math.round(utcOffset)}`,
+  /** Photos, analysis and Telegram report now; answers "capturing" and "analyzing" (per photo), "sending", then "ready". */
   report: "report",
 };
 
-/** "127,07:00,480" (the Info "schedule" value) → schedule; null when off or unreadable. */
+/** "127,07:00,480" or "every:30,480" (the Info "schedule" value) → schedule; null when off or unreadable. */
 export function parseSchedule(text: string): DeviceSchedule | null {
+  const every = /^every:(\d+),(-?\d+)$/.exec(text);
+  if (every) {
+    const everyMinutes = Number(every[1]);
+    if (everyMinutes < 1 || everyMinutes > 1440) return null;
+    return { days: [0, 1, 2, 3, 4, 5, 6], time: "00:00", utcOffset: Number(every[2]), everyMinutes };
+  }
   const [mask = "", time = "", offset = ""] = text.split(",");
   if (!/^\d+$/.test(mask) || !TIME_PATTERN.test(time) || !/^-?\d+$/.test(offset)) return null;
   const bits = Number(mask);
@@ -84,6 +97,17 @@ export function truncateBytes(text: string, maxBytes: number): string {
 export function firmwareMajor(version: string): number {
   const n = Number.parseInt(version, 10);
   return Number.isFinite(n) ? n : 0;
+}
+
+/** "3.3.0" is at least "3.3"; "unknown" is at least nothing. */
+export function firmwareAtLeast(version: string, minimum: string): boolean {
+  const parts = (v: string) => v.split(".").map((p) => Number.parseInt(p, 10) || 0);
+  const have = parts(version);
+  const want = parts(minimum);
+  for (let i = 0; i < want.length; i++) {
+    if ((have[i] ?? 0) !== want[i]) return (have[i] ?? 0) > want[i];
+  }
+  return true;
 }
 
 export type DeviceStatus = { state: "ready" | "connecting" | "capturing" | "analyzing" | "sending" } | { state: "error"; message: string };

@@ -40,11 +40,6 @@ export const visionSettingsSchema = z.object({
     /** Keep blobs whose bounding box lies within this percent of the image's long edge of the main blob. */
     mergeDistancePct: z.number().min(0).max(100),
   }),
-  plantRegion: z.object({
-    /** "hull": convex hull of the leaf mask; "dilate": leaf mask grown by dilatePx. */
-    mode: z.enum(["hull", "dilate"]),
-    dilatePx: z.number().int().min(0).max(200),
-  }),
   quality: z.object({
     /** Mean brightness limits, percent. */
     minBrightness: z.number().min(0).max(100),
@@ -62,8 +57,16 @@ export const DEFAULT_VISION_SETTINGS: VisionSettings = {
   stressed: { hueMin: 20, hueMax: 65, satMin: 25, valMin: 15 },
   whiteBalance: { enabled: true, maxSaturation: 35, minValue: 25, normalizeExposure: true, targetGray: 230 },
   cleanup: { openSize: 3, closeSize: 5, stressedOpenSize: 3, minBlobPct: 0.1, mergeDistancePct: 5 },
-  plantRegion: { mode: "hull", dilatePx: 15 },
   quality: { minBrightness: 20, maxBrightness: 90, minSharpness: 25 },
+};
+
+/**
+ * What the camera analyzes with (firmware/esp32-cam/vision.cpp, checked by tests/camera-vision.test.ts):
+ * the defaults, with the closing kernel scaled to its CAMERA_SQUARE_PX square (3 is the smallest opening).
+ */
+export const CAMERA_VISION_SETTINGS: VisionSettings = {
+  ...DEFAULT_VISION_SETTINGS,
+  cleanup: { ...DEFAULT_VISION_SETTINGS.cleanup, openSize: 3, closeSize: 3, stressedOpenSize: 3 },
 };
 
 type PlainObject = Record<string, unknown>;

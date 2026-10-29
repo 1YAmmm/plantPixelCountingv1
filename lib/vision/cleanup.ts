@@ -84,3 +84,22 @@ export function cleanupLeafMask(
     plantBox: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
   };
 }
+
+/**
+ * Plan §5 step 7: the plant, in which yellow/brown pixels count as discoloration. It is the green
+ * and the yellow/brown pixels together, cleaned up like the leaf mask: the main blob and the blobs
+ * near it. So a fully yellowed leaf is part of the plant, and a brown object away from it is not.
+ */
+export function plantRegion(
+  leaf: BinaryMask,
+  stressed: BinaryMask,
+  width: number,
+  height: number,
+  roi: BinaryMask,
+  roiPixels: number,
+  settings: VisionSettings["cleanup"],
+): BinaryMask {
+  const both = new Uint8Array(leaf.length);
+  for (let i = 0; i < both.length; i++) both[i] = leaf[i] | stressed[i];
+  return cleanupLeafMask(both, width, height, roi, roiPixels, settings).mask;
+}

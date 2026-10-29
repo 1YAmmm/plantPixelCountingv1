@@ -102,12 +102,12 @@ describe("pipeline — cleanup and discoloration", () => {
     expect(Math.abs(spotted.analysis.metrics.discolorationPct - truthPct)).toBeLessThan(2);
   });
 
-  it("only partly counts fully yellow outer leaves (they lie outside the green hull)", async () => {
-    // Plan §5 step 7: the region is the hull of the *green* mask. Yellowed leaves still lower the
-    // green leaf cover, which is what drives the wilting index.
+  it("counts fully yellowed leaves as discoloration (the plant is green and yellow/brown together)", async () => {
     const healthy = await analyzeScene(rosetteScene({}));
     const yellowed = await analyzeScene(rosetteScene({ yellowLeaves: 2 }));
-    expect(yellowed.analysis.metrics.discolorationPct).toBeGreaterThan(2);
+    const truthPct = (100 * yellowed.truth.stressedPixels) / (yellowed.truth.leafPixels + yellowed.truth.stressedPixels);
+    expect(Math.abs(yellowed.analysis.metrics.discolorationPct - truthPct)).toBeLessThan(2);
+    // The yellowed leaves are no longer green leaf cover.
     expect(yellowed.analysis.metrics.coveragePct).toBeLessThan(healthy.analysis.metrics.coveragePct * 0.8);
   });
 

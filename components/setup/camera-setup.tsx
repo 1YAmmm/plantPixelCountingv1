@@ -7,7 +7,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { esp32Camera } from "@/lib/ble/esp32-camera";
-import { firmwareMajor, TELEGRAM_FIRMWARE, type DeviceStatus } from "@/lib/ble/protocol";
+import { firmwareAtLeast, firmwareMajor, INTERVAL_FIRMWARE, TELEGRAM_FIRMWARE, type DeviceStatus } from "@/lib/ble/protocol";
 import { describeSchedule, formatUtcOffset } from "@/lib/schedule";
 import { ScheduleStep } from "./schedule-step";
 import { cameraError, errorMessage, StepRow, useCamera, useMounted } from "./shared";
@@ -200,14 +200,14 @@ export function CameraSetup() {
             onChange={change(3)}
             summary={info.schedule && <span>{`${describeSchedule(info.schedule)} (${formatUtcOffset(info.schedule.utcOffset)})`}</span>}
           >
-            <ScheduleStep current={info.schedule} canSave={canSave} onDone={finish} onCancel={cancel(3)} />
+            <ScheduleStep current={info.schedule} canSave={canSave} intervals={firmwareAtLeast(info.firmware, INTERVAL_FIRMWARE)} onDone={finish} onCancel={cancel(3)} />
           </StepRow>
         </ol>
 
         {firstOpen == null && editing == null && info.schedule && (
           <div className="space-y-3 rounded-lg border bg-muted/40 p-3">
             <p className="text-sm">
-              All set. {describeSchedule(info.schedule)}, the camera takes a photo, analyzes it and sends the report to {info.telegramLabel ?? "Telegram"}. You can
+              All set. {describeSchedule(info.schedule)}, the camera takes 3 photos, measures the leaves and sends the result to {info.telegramLabel ?? "Telegram"}. You can
               disconnect and close this page: the camera works on its own.
             </p>
             {!info.clock && (

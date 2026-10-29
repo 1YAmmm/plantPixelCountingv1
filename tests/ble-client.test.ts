@@ -110,10 +110,10 @@ class FakePlantCam extends EventTarget {
       else if (v3 && name === "tg-label") this.telegram.label = value;
       else if (v3 && name === "schedule") this.schedule = value;
       else if (v3 && t === "report") {
-        this.setStatus("capturing");
-        setTimeout(() => this.setStatus("analyzing"), 2);
-        setTimeout(() => (this.disconnectDuringReport ? this.gatt.disconnect() : this.setStatus("sending")), 4);
-        setTimeout(() => this.connected && this.setStatus(this.reportResult), 6);
+        // Three photos, each taken and analyzed, then the result to Telegram.
+        ["capturing", "analyzing", "capturing", "analyzing", "capturing", "analyzing"].forEach((s, i) => setTimeout(() => this.setStatus(s), i));
+        setTimeout(() => (this.disconnectDuringReport ? this.gatt.disconnect() : this.setStatus("sending")), 7);
+        setTimeout(() => this.connected && this.setStatus(this.reportResult), 9);
         return;
       } else return this.setStatus("error:unknown command");
       this.updateInfo();
@@ -224,5 +224,13 @@ describe("test report", () => {
     device.disconnectDuringReport = true;
     await expect(camera.sendReport()).rejects.toThrow(/disconnected/);
     expect(camera.getSnapshot()).toMatchObject({ connection: "disconnected", busy: false });
+  });
+});
+
+describe("schedule every few minutes", () => {
+  it("saves it and reads it back", async () => {
+    const info = await camera.setSchedule({ days: [0, 1, 2, 3, 4, 5, 6], time: "00:00", utcOffset: 480, everyMinutes: 30 });
+    expect(device.commands).toEqual(["schedule:every:30,480"]);
+    expect(info?.schedule).toEqual({ days: [0, 1, 2, 3, 4, 5, 6], time: "00:00", utcOffset: 480, everyMinutes: 30 });
   });
 });

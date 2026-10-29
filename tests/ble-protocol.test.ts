@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 import {
   command,
   CONTROL_UUID,
+  firmwareAtLeast,
   firmwareMajor,
   INFO_UUID,
+  INTERVAL_FIRMWARE,
   MAX_COMMAND_LENGTH,
   MAX_LABEL_BYTES,
   parseInfo,
@@ -70,6 +72,14 @@ describe("info", () => {
     expect(firmwareMajor("2.0.0")).toBe(2);
     expect(firmwareMajor("unknown")).toBe(0);
   });
+
+  it("compares firmware versions", () => {
+    expect(firmwareAtLeast("3.3.0", "3.3")).toBe(true);
+    expect(firmwareAtLeast("3.10.0", "3.3")).toBe(true);
+    expect(firmwareAtLeast("4.0.0", "3.3")).toBe(true);
+    expect(firmwareAtLeast("3.2.0", "3.3")).toBe(false);
+    expect(firmwareAtLeast("unknown", "3.3")).toBe(false);
+  });
 });
 
 describe("schedule", () => {
@@ -79,18 +89,23 @@ describe("schedule", () => {
     expect(command.schedule({ days: [], time: "07:00", utcOffset: 0 })).toBe("schedule:0,07:00,0");
   });
 
+  it("formats a schedule every few minutes, round the clock", () => {
+    expect(command.schedule({ days: [0, 1, 2, 3, 4, 5, 6], time: "00:00", utcOffset: 480, everyMinutes: 30 })).toBe("schedule:every:30,480");
+  });
+
   it("parses what it formats", () => {
     for (const s of [
       { days: [0, 6], time: "00:00", utcOffset: 0 },
       { days: [1, 3, 5], time: "23:59", utcOffset: 330 },
       { days: [2], time: "12:15", utcOffset: -210 },
+      { days: [0, 1, 2, 3, 4, 5, 6], time: "00:00", utcOffset: 480, everyMinutes: 720 },
     ]) {
       expect(parseSchedule(command.schedule(s).slice("schedule:".length))).toEqual(s);
     }
   });
 
   it("returns null when off or unreadable", () => {
-    for (const text of ["0,07:00,480", "128,07:00,480", "127,7:00,480", "127,24:00,480", "127,07:00,", "127,07:00,4.5", "", "abc"]) {
+    for (const text of ["0,07:00,480", "128,07:00,480", "127,7:00,480", "127,24:00,480", "127,07:00,", "127,07:00,4.5", "", "abc", "every:0,480", "every:1441,480", "every:30"]) {
       expect(parseSchedule(text)).toBeNull();
     }
   });
@@ -140,6 +155,8 @@ describe("firmware", () => {
     for (const c of [prefix(command.telegramToken("x")), prefix(command.telegramChat(1)), prefix(command.telegramLabel("x")), prefix(command.schedule({ days: [1], time: "07:00", utcOffset: 0 })), command.report]) {
       expect(firmware).toContain(`"${c}"`);
     }
+    expect(firmwareAtLeast(define("FIRMWARE_VERSION") ?? "", INTERVAL_FIRMWARE)).toBe(true);
+    expect(firmware).toContain('"every:"');
     for (const key of ["telegram", "tgLabel", "schedule", "clock", "wifi", "ssid", "ip"]) {
       expect(firmware).toContain(`\\"${key}\\":`);
     }

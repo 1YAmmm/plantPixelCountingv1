@@ -1,7 +1,7 @@
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { hueInRange, rgbToHsv } from "@/lib/vision/color";
-import { convexHull, dilateSquare, fillConvexPolygon, maskHull, rectGap } from "@/lib/vision/geometry";
+import { rectGap } from "@/lib/vision/geometry";
 import { guideRect, SQUARE_PX } from "@/lib/vision/guide";
 import { cropGuideSquare } from "@/lib/vision/node";
 import { buildRoiMask } from "@/lib/vision/roi";
@@ -113,42 +113,6 @@ describe("cropGuideSquare", () => {
 });
 
 describe("geometry", () => {
-  it("finds the convex hull", () => {
-    const pts = [
-      { x: 0, y: 0 },
-      { x: 4, y: 0 },
-      { x: 4, y: 4 },
-      { x: 0, y: 4 },
-      { x: 2, y: 2 },
-      { x: 1, y: 3 },
-    ];
-    expect(convexHull(pts)).toHaveLength(4);
-  });
-
-  it("rasterizes a polygon by pixel centres", () => {
-    const square = [
-      { x: 2, y: 2 },
-      { x: 6, y: 2 },
-      { x: 6, y: 5 },
-      { x: 2, y: 5 },
-    ];
-    expect(fillConvexPolygon(square, 10, 10).reduce((s, v) => s + v, 0)).toBe(12);
-  });
-
-  it("fills the hull of an L-shaped mask", () => {
-    // 3×3 L: hull covers the missing corner's half → filled hull includes the L plus the diagonal half.
-    const m = new Uint8Array([1, 0, 0, 1, 0, 0, 1, 1, 1]);
-    const filled = fillConvexPolygon(maskHull(m, 3, 3), 3, 3);
-    for (let i = 0; i < 9; i++) if (m[i]) expect(filled[i]).toBe(1);
-  });
-
-  it("dilates with a square kernel", () => {
-    const m = new Uint8Array(25);
-    m[12] = 1;
-    expect(dilateSquare(m, 5, 5, 1).reduce((s, v) => s + v, 0)).toBe(9);
-    expect(dilateSquare(m, 5, 5, 2).reduce((s, v) => s + v, 0)).toBe(25);
-  });
-
   it("measures the gap between rectangles", () => {
     expect(rectGap({ x: 0, y: 0, width: 10, height: 10 }, { x: 13, y: 14, width: 5, height: 5 })).toBeCloseTo(5, 6);
     expect(rectGap({ x: 0, y: 0, width: 10, height: 10 }, { x: 5, y: 5, width: 10, height: 10 })).toBe(0);

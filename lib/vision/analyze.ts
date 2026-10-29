@@ -1,8 +1,7 @@
 import { classifyPixels } from "./classify";
-import { cleanupLeafMask, openMask, type CleanupResult } from "./cleanup";
+import { cleanupLeafMask, openMask, plantRegion, type CleanupResult } from "./cleanup";
 import { measure, type Metrics } from "./measure";
 import { imageQualityIssues, meanBrightness, sharpnessScore, type QualityIssue } from "./quality";
-import { plantRegion } from "./region";
 import { buildRoiMask } from "./roi";
 import type { VisionSettings } from "./settings";
 import type { BinaryMask, NormRect, RgbImage } from "./types";
@@ -64,12 +63,13 @@ export function analyzeImage(img: RgbImage, opts: AnalyzeOptions): Analysis {
   const cleaned = cleanupLeafMask(cls.leaf, width, height, roi.mask, roi.count, settings.cleanup);
   lap("cleanup");
 
-  // Step 7 — plant region; stressed pixels count only inside it and not where the leaf mask already is.
-  const region = plantRegion(cleaned.mask, width, height, settings.plantRegion);
+  // Step 7 — the plant (green and yellow/brown pixels); stressed pixels count only inside it and
+  // not where the leaf mask already is.
+  const region = plantRegion(cls.leaf, cls.stressed, width, height, roi.mask, roi.count, settings.cleanup);
   const stressedOpen = openMask(cls.stressed, width, height, settings.cleanup.stressedOpenSize);
   const stressed = new Uint8Array(width * height);
   for (let i = 0; i < stressed.length; i++) {
-    if (stressedOpen[i] && region.mask[i] && !cleaned.mask[i] && roi.mask[i]) stressed[i] = 1;
+    if (stressedOpen[i] && region[i] && !cleaned.mask[i] && roi.mask[i]) stressed[i] = 1;
   }
   lap("region");
 
@@ -92,7 +92,7 @@ export function analyzeImage(img: RgbImage, opts: AnalyzeOptions): Analysis {
     sharpness,
     issues,
     cleanup: { blobCount: cleaned.blobCount, keptBlobs: cleaned.keptBlobs, plantBox: cleaned.plantBox },
-    masks: { leaf: cleaned.mask, stressed, roi: roi.mask, region: region.mask },
+    masks: { leaf: cleaned.mask, stressed, roi: roi.mask, region },
     timingsMs,
   };
 }

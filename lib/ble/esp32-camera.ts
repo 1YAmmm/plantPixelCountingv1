@@ -47,7 +47,7 @@ interface Characteristics {
 const COMMAND_TIMEOUT_MS = 6_000;
 /** The firmware tries to join the WiFi for up to 15 s. */
 const WIFI_CONNECT_TIMEOUT_MS = 20_000;
-/** A report: photo, analysis, then the upload to Telegram over a slow link. */
+/** The longest wait between a report's steps (photos, analyses, the upload to Telegram over a slow link). */
 const REPORT_TIMEOUT_MS = 90_000;
 
 const decoder = new TextDecoder();
@@ -196,7 +196,7 @@ export class Esp32Camera {
     return this.run([command.schedule(schedule)]);
   }
 
-  /** Take a photo, analyze it and send the report to Telegram now. */
+  /** Take the photos, analyze them and send the report to Telegram now. */
   async sendReport(): Promise<void> {
     await this.run([], { text: command.report, timeoutMs: REPORT_TIMEOUT_MS });
   }

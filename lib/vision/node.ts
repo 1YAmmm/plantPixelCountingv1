@@ -1,6 +1,6 @@
 import sharp from "sharp";
 import { analyzeImage, type Analysis, type AnalyzeOptions } from "./analyze";
-import { guideRect, SQUARE_PX } from "./guide";
+import { CAMERA_SQUARE_PX, guideBox, SQUARE_PX } from "./guide";
 import { renderOverlay } from "./overlay";
 import type { RgbImage } from "./types";
 
@@ -38,21 +38,51 @@ export async function prepareImage(input: Buffer, maxLongEdge: number | null): P
 
 /**
  * The centred guide square of a full camera photo, scaled to SQUARE_PX × SQUARE_PX: the reference
- * for the crop the camera's firmware does before analyzing, so every photo is framed the same way.
+ * for the crop the camera's firmware does before analyzing (cameraSquare), so every photo is framed the same way.
  */
 export async function cropGuideSquare(input: Buffer): Promise<Buffer> {
   const { autoOrient } = await sharp(input, { failOn: "error" }).metadata();
-  const { width, height } = autoOrient;
-  const r = guideRect(width, height);
-  const side = Math.max(1, Math.min(Math.floor(r.width * width), width, height));
-  const left = Math.min(width - side, Math.max(0, Math.round(r.x * width)));
-  const top = Math.min(height - side, Math.max(0, Math.round(r.y * height)));
+  const { left, top, side } = guideBox(autoOrient.width, autoOrient.height);
   return sharp(input, { failOn: "error" })
     .autoOrient()
     .extract({ left, top, width: side, height: side })
     .resize(SQUARE_PX, SQUARE_PX)
     .jpeg({ quality: 90 })
     .toBuffer();
+}
+
+/**
+ * The crop the camera does (firmware/esp32-cam/vision.cpp), to check its numbers: the guide square
+ * shrunk to CAMERA_SQUARE_PX by averaging the photo pixels in each cell, rounded like the firmware.
+ */
+export async function cameraSquare(input: Buffer): Promise<RgbImage> {
+  const { width, height, data } = await decodeImage(input);
+  const { left, top, side } = guideBox(width, height);
+  const n = Math.min(CAMERA_SQUARE_PX, side);
+  const cell = (s: number) => Math.floor((s * n) / side);
+  // Photo pixels per grid row (and column), so a cell has cells[row] × cells[column].
+  const cells = new Uint32Array(n);
+  for (let s = 0; s < side; s++) cells[cell(s)]++;
+  const sums = new Uint32Array(n * n * 3);
+  for (let y = 0; y < side; y++) {
+    const row = cell(y) * n;
+    for (let x = 0; x < side; x++) {
+      const p = ((top + y) * width + left + x) * 3;
+      const t = (row + cell(x)) * 3;
+      sums[t] += data[p];
+      sums[t + 1] += data[p + 1];
+      sums[t + 2] += data[p + 2];
+    }
+  }
+  const out = new Uint8Array(n * n * 3);
+  for (let ty = 0; ty < n; ty++) {
+    for (let tx = 0; tx < n; tx++) {
+      const count = cells[ty] * cells[tx];
+      const t = (ty * n + tx) * 3;
+      for (let k = 0; k < 3; k++) out[t + k] = Math.floor((sums[t + k] + (count >> 1)) / count);
+    }
+  }
+  return { width: n, height: n, data: out, channels: 3 };
 }
 
 export interface PipelineResult {

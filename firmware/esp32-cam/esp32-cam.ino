@@ -1,7 +1,8 @@
-// PlantCam: an AI-Thinker ESP32-CAM that photographs a plant on a schedule and sends the report to
-// Telegram by itself. The web app only sets it up over Bluetooth (BLE): the WiFi, the Telegram bot
-// token and chat, and the days and time of the report, all kept in flash. The commands and the Info
-// JSON are described in lib/ble/protocol.ts; keep the two in sync (tests/ble-protocol.test.ts
+// PlantCam: an AI-Thinker ESP32-CAM that photographs a plant on a schedule, measures the leaves
+// (vision.cpp, the camera's port of lib/vision) and sends Telegram a picture of the plant beside
+// its leaf mask, with the status (lib/detection) and the numbers, by itself. The web app only sets it up over Bluetooth (BLE): the WiFi, the Telegram bot
+// token and chat, and the days and time of the report, all kept in flash. The commands and the
+// Info JSON are described in lib/ble/protocol.ts; keep the two in sync (tests/ble-protocol.test.ts
 // checks the UUIDs and the command names).
 //
 // Board: "AI Thinker ESP32-CAM" (esp32:esp32:esp32cam, core 3.x), partition "Huge APP", PSRAM.
@@ -11,7 +12,8 @@
 //
 // Instruction RAM (IRAM) is nearly full: BLE, WiFi and the PSRAM cache workaround, which also puts
 // libc's time functions in IRAM. So no time()/localtime()/strftime(): dates are computed here from
-// gettimeofday(). The TLS buffers go to PSRAM, so HTTPS to Telegram fits next to BLE and WiFi.
+// gettimeofday(), and numbers are formatted without printf's "%f" (decimal()). The TLS buffers go
+// to PSRAM, so HTTPS to Telegram fits next to BLE and WiFi; so does the analysis (about 2.5 MB).
 
 #include <Arduino.h>
 #include <BLE2902.h>
@@ -29,8 +31,9 @@
 #include "lwip/apps/sntp.h"
 #include "lwip/priv/tcpip_priv.h"
 #include "mbedtls/platform.h"
+#include "vision.h"
 
-#define FIRMWARE_VERSION "3.0.0"
+#define FIRMWARE_VERSION "3.4.0"
 
 #define SERVICE_UUID "7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define CONTROL_UUID "7a1e0001-5c3b-4d2a-8f1e-3b9c6d4a2e10"
@@ -68,11 +71,18 @@ static const uint32_t WIFI_RETRY_MS = 60000;    // begin() again if still not co
 static const uint32_t RESTART_AFTER_MS = 30UL * 60 * 1000;  // WiFi set up but down this long, nobody on BLE: restart
 static const uint32_t HTTP_TIMEOUT_MS = 30000;
 static const uint32_t REPORT_RETRY_MS = 5UL * 60 * 1000;  // a report that could not reach Telegram
-static const int32_t LATE_LIMIT_MIN = 180;  // a report missed at the set time (power, WiFi) is still sent this long after
-static const int32_t LATE_AFTER_MIN = 15;   // and is marked late after this
+static const int32_t LATE_LIMIT_MIN = 180;  // a daily report missed at the set time (power, WiFi) is still sent this long after
+static const int32_t LATE_AFTER_MIN = 15;   // and is marked late after this; a missed "every N minutes" report is sent this long after
 static const time_t CLOCK_VALID_AFTER = 1704067200;  // 2024-01-01: an earlier clock was never set
 static const size_t MAX_LABEL_BYTES = 120;
 static const uint32_t CAMERA_SETTLE_MS = 1500;  // auto exposure and white balance after a start
+
+// The status, straight from the photo: how much of the plant is yellow or brown (lib/detection;
+// tests/camera-vision.test.ts checks these). A report takes PHOTOS_PER_REPORT photos one after the
+// other and uses the middle one by leaf cover, so one bad frame does not decide it.
+static const float ATTENTION_PCT = 15;  // discoloration for Needs attention
+static const float UNHEALTHY_PCT = 30;  // and for Unhealthy
+static const int PHOTOS_PER_REPORT = 3;
 
 struct Command {
   char text[200];  // long enough for "tg-label:<label>" and "wifi-pass:<password>"
@@ -80,6 +90,21 @@ struct Command {
 
 /** How a report ended. Up here for the .ino prototypes. */
 enum ReportResult { REPORT_SENT, REPORT_FAILED, REPORT_REFUSED };
+
+/** A JPEG in a Telegram upload: `field` is the form field. */
+struct Upload {
+  const char *field;
+  const uint8_t *data;
+  size_t len;
+};
+
+/** One analyzed photo of a report. */
+struct Shot {
+  VisionResult r;
+  const char *error;  // why it could not be measured, or nullptr
+  uint8_t *picture;   // the measured square beside its mask, a JPEG in PSRAM, or nullptr
+  size_t pictureLen;
+};
 
 static BLEServer *server = nullptr;
 static BLECharacteristic *statusChar = nullptr;
@@ -94,10 +119,12 @@ static bool cameraRunning = false;  // the driver is started (stopped during upl
 static uint32_t cameraStartedAt = 0;
 static bool restartWhenIdle = false;  // the internal RAM ran out: restart once nobody is on BLE
 
-// The last photo, in PSRAM.
+// The last photo, and the last picture sent (the measured square beside its mask), in PSRAM.
 static uint8_t *jpeg = nullptr;
 static size_t jpegLen = 0;
 static size_t jpegCap = 0;
+static uint8_t *pictureJpeg = nullptr;
+static size_t pictureLen = 0;
 
 // Settings (Preferences).
 static String wifiSsid;
@@ -107,9 +134,10 @@ static String tgChat;
 static String tgLabel;
 static uint8_t schedDays = 0;      // bit 0 = Sunday … bit 6 = Saturday; 0 = no reports
 static uint16_t schedMinute = 0;   // minute of the day, local time
+static uint16_t schedEvery = 0;    // or every this many minutes round the clock (then schedDays = 127)
 static int16_t schedOffset = 0;    // local time = UTC + this many minutes
 static uint32_t lastSlot = 0;      // the last scheduled time handled, local minutes since 1970
-static bool skipPastSlots = false; // a new schedule starts with its next time, not one already past today
+static bool skipPastSlots = false; // a new schedule starts with its next time, not one already past
 
 // WiFi and clock state.
 static bool wifiDirty = false;  // a new name or password since the last "wifi:connect"
@@ -169,18 +197,25 @@ static void civilFromDays(int64_t days, int &y, unsigned &m, unsigned &d) {
   y = (int)(yoe + era * 400 + (m <= 2));
 }
 
-/** "Thu 29 Oct 2026, 7:00" for local minutes since 1970. */
+/** A minute of the day on a 12-hour clock: 1140 → "7:00 PM", 0 → "12:00 AM". */
+static String formatClock(int minuteOfDay) {
+  int h = minuteOfDay / 60;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d:%02d %s", h % 12 ? h % 12 : 12, minuteOfDay % 60, h < 12 ? "AM" : "PM");
+  return buf;
+}
+
+/** "Thu 29 Oct 2026, 7:00 AM" for local minutes since 1970. */
 static String formatLocal(int64_t localMin) {
   static const char *DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
   static const char *MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   int64_t day = localMin / 1440;
-  int minute = (int)(localMin % 1440);
   int y;
   unsigned m, d;
   civilFromDays(day, y, m, d);
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%s %u %s %d, %d:%02d", DAYS[weekday(day)], d, MONTHS[m - 1], y, minute / 60, minute % 60);
-  return buf;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%s %u %s %d, ", DAYS[weekday(day)], d, MONTHS[m - 1], y);
+  return buf + formatClock((int)(localMin % 1440));
 }
 
 /** 480 → "UTC+8", 330 → "UTC+5:30". */
@@ -236,11 +271,12 @@ static bool telegramReady() {
   return tgToken.length() && tgChat.length();
 }
 
-/** "62,07:00,480" (days, time, UTC offset), as the web app sends it; empty when there is none. */
+/** "62,07:00,480" (days, time, UTC offset) or "every:30,480", as the web app sends it; empty when there is none. */
 static String scheduleText() {
   if (!schedDays) return String();
   char buf[24];
-  snprintf(buf, sizeof(buf), "%u,%02u:%02u,%d", schedDays, schedMinute / 60, schedMinute % 60, schedOffset);
+  if (schedEvery) snprintf(buf, sizeof(buf), "every:%u,%d", schedEvery, schedOffset);
+  else snprintf(buf, sizeof(buf), "%u,%02u:%02u,%d", schedDays, schedMinute / 60, schedMinute % 60, schedOffset);
   return buf;
 }
 
@@ -285,18 +321,24 @@ static bool validChatId(const char *t) {
   return true;
 }
 
-/** "schedule:<days>,<HH:MM>,<offset>". */
+/** "schedule:<days>,<HH:MM>,<offset>", or "schedule:every:<minutes>,<offset>" round the clock. */
 static bool saveSchedule(const char *args) {
-  unsigned days, hh, mm;
+  unsigned days = 127, hh = 0, mm = 0, every = 0;
   int offset;
   char end;
-  if (sscanf(args, "%u,%u:%u,%d%c", &days, &hh, &mm, &offset, &end) != 4) return false;
-  if (days > 127 || hh > 23 || mm > 59 || offset < -720 || offset > 840) return false;
+  if (strncmp(args, "every:", 6) == 0) {
+    if (sscanf(args + 6, "%u,%d%c", &every, &offset, &end) != 2 || every < 1 || every > 1440) return false;
+  } else if (sscanf(args, "%u,%u:%u,%d%c", &days, &hh, &mm, &offset, &end) != 4 || days > 127 || hh > 23 || mm > 59) {
+    return false;
+  }
+  if (offset < -720 || offset > 840) return false;
   schedDays = days;
   schedMinute = hh * 60 + mm;
+  schedEvery = every;
   schedOffset = offset;
   prefs.putUChar("sdays", schedDays);
   prefs.putUShort("stime", schedMinute);
+  prefs.putUShort("severy", schedEvery);
   prefs.putShort("soff", schedOffset);
   skipPastSlots = true;
   nextReportTryAt = millis();
@@ -307,7 +349,7 @@ static bool saveSchedule(const char *args) {
 
 /**
  * Start the camera driver. It takes about 43 KB of internal RAM (DMA buffers, its task), which the
- * upload to Telegram needs next to BLE and WiFi, so sendReport() stops it during the upload.
+ * upload to Telegram needs next to BLE and WiFi, so analyzePhoto() stops it until after the upload.
  */
 static esp_err_t startCamera() {
   if (cameraRunning) return ESP_OK;
@@ -486,12 +528,16 @@ static String jsonDescription(const String &body) {
   return out;
 }
 
+static String fileHead(const Upload &f) {
+  return String("--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"") + f.field + "\"; filename=\"" + f.field + ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+}
+
 /**
- * POST `fields` (form fields from formField()) and an optional JPEG as "photo" to the Bot API
- * method. Returns the HTTP status, or a negative number when Telegram could not be reached, with
- * the reason in `error`. The certificate is checked with the core's root certificate bundle.
+ * POST `fields` (form fields from formField()) and `fileCount` JPEGs to the Bot API method.
+ * Returns the HTTP status, or a negative number when Telegram could not be reached, with the
+ * reason in `error`. The certificate is checked with the core's root certificate bundle.
  */
-static int telegramPost(const char *method, const String &fields, const uint8_t *photo, size_t photoLen, String &error) {
+static int telegramPost(const char *method, const String &fields, const Upload *files, int fileCount, String &error) {
   static NetworkClientSecure *tls = nullptr;
   static bool heapLogged = false;
   if (!tls) {
@@ -513,16 +559,14 @@ static int telegramPost(const char *method, const String &fields, const uint8_t 
     logHeap("after the first TLS handshake");
   }
 
-  String photoHead;
-  String tail = "--" BOUNDARY "--\r\n";
-  if (photo) {
-    photoHead = "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"plant.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-    tail = "\r\n" + tail;
-  }
-  size_t contentLength = fields.length() + photoHead.length() + photoLen + tail.length();
+  const String tail = "--" BOUNDARY "--\r\n";
+  size_t contentLength = fields.length() + tail.length();
+  for (int i = 0; i < fileCount; i++) contentLength += fileHead(files[i]).length() + files[i].len + 2;
   String head = String("POST /bot") + tgToken + "/" + method + " HTTP/1.1\r\nHost: " TELEGRAM_HOST "\r\nUser-Agent: PlantCam/" FIRMWARE_VERSION
                 "\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: " + String((unsigned)contentLength) + "\r\n\r\n";
-  if (!writeAll(*tls, head) || !writeAll(*tls, fields) || !writeAll(*tls, photoHead) || (photo && !writeAll(*tls, photo, photoLen)) || !writeAll(*tls, tail)) {
+  bool sent = writeAll(*tls, head) && writeAll(*tls, fields);
+  for (int i = 0; i < fileCount && sent; i++) sent = writeAll(*tls, fileHead(files[i])) && writeAll(*tls, files[i].data, files[i].len) && writeAll(*tls, "\r\n");
+  if (!sent || !writeAll(*tls, tail)) {
     tls->stop();
     error = "the upload was cut off";
     return -2;
@@ -562,44 +606,150 @@ static int telegramPost(const char *method, const String &fields, const uint8_t 
   return code;
 }
 
-// ---- Reports ----
+// ---- Analysis ----
 
-/** The photo's caption: camera, local time, and `note` ("Test report", "Sent 20 min late"). */
-static String reportCaption(const String &note) {
-  String c = "\xF0\x9F\x8C\xB1 ";  // seedling emoji
-  c += deviceName;
-  c += "\n";
-  c += clockValid() ? formatLocal(localMinutes()) + " (" + formatOffset(schedOffset) + ")" : String("Time not known yet");
-  if (note.length()) c += "\n" + note;
-  c += "\nPhoto only for now: the leaf analysis comes with the next firmware.";
-  return c;
+/** `v` rounded to `decimals` places (0–3), without printf's "%f" (see the top). */
+static String decimal(float v, int decimals) {
+  long scale = 1;
+  for (int i = 0; i < decimals; i++) scale *= 10;
+  long x = (long)(v * scale + (v < 0 ? -0.5f : 0.5f));
+  String s = x < 0 ? "-" : "";
+  if (x < 0) x = -x;
+  s += String(x / scale);
+  if (decimals) s += "." + String(x % scale + scale).substring(1);  // keeps the leading zeros
+  return s;
+}
+
+/** The result as one JSON line in the serial log, to compare with lib/vision on the PC. */
+static void logAnalysis(const Shot &s) {
+  const VisionResult &r = s.r;
+  if (s.error) {
+    Serial.printf("[analysis] failed: %s\n", s.error);
+    return;
+  }
+  String j = "{\"size\":" + String(r.size) + ",\"cover\":" + decimal(r.coverPct, 3) + ",\"discoloration\":" + decimal(r.discolorationPct, 3);
+  j += ",\"brightness\":" + decimal(r.brightnessPct, 2) + ",\"sharpness\":" + decimal(r.sharpness, 2) + ",\"issues\":" + String(r.issues);
+  j += ",\"leaf\":" + String(r.leafPixels) + ",\"stressed\":" + String(r.stressedPixels) + ",\"blobs\":" + String(r.blobCount) + ",\"kept\":" + String(r.keptBlobs);
+  j += ",\"whiteBalanced\":" + String(r.whiteBalanced ? "true" : "false") + ",\"gains\":[";
+  for (int k = 0; k < 3; k++) j += decimal(r.gains[k], 3) + (k < 2 ? "," : "],\"reference\":[");
+  for (int k = 0; k < 3; k++) j += decimal(r.reference[k], 1) + (k < 2 ? "," : "]");
+  j += ",\"decodeMs\":" + String(r.decodeMs) + ",\"analyzeMs\":" + String(r.analyzeMs);
+  j += ",\"pictureMs\":" + String(r.pictureMs) + ",\"pictureBytes\":" + String((unsigned)s.pictureLen) + "}";
+  Serial.printf("[analysis] %s\n", j.c_str());
+  Serial.printf("[analysis] loop stack left: %u bytes\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 /**
- * Take a photo and send it to the Telegram chat. `quiet` (a scheduled report) shows the progress
- * in the serial log only. REPORT_REFUSED means trying again would not help (wrong token or chat,
- * or a broken camera, which the chat is told about).
+ * Analyze the photo in `jpeg` (vision.cpp) and make its picture. The camera is stopped first: the
+ * analysis needs its frame buffer's PSRAM, and the upload after it needs its internal RAM.
  */
-static ReportResult sendReport(bool quiet, const String &note) {
+static void analyzePhoto(Shot &s) {
+  stopCamera();
+  s.picture = nullptr;
+  s.pictureLen = 0;
+  s.error = analyzeJpeg(jpeg, jpegLen, s.r, &s.picture, &s.pictureLen);
+  logAnalysis(s);
+}
+
+/** Keep the shot's picture as the last one (for the serial "picture" command). */
+static void keepPicture(Shot &s) {
+  heap_caps_free(pictureJpeg);
+  pictureJpeg = s.picture;
+  pictureLen = s.pictureLen;
+  s.picture = nullptr;
+}
+
+// ---- Status (lib/detection/status.ts) ----
+
+#define ICON_UNKNOWN "\xE2\x9A\xAA "  // white circle
+static const char *const STATUS_LABELS[] = {"Healthy", "Needs attention", "Unhealthy"};
+static const char *const STATUS_ICONS[] = {"\xF0\x9F\x9F\xA2 ", "\xF0\x9F\x9F\xA1 ", "\xF0\x9F\x94\xB4 "};  // green, yellow, red circles
+static const char *const STATUS_LINES[] = {"Most of the leaves are green.", "Some leaves are turning yellow or brown.", "Many leaves are yellow or brown."};
+
+/** statusFromDiscoloration(): 0 Healthy, 1 Needs attention, 2 Unhealthy. */
+static int statusFromDiscoloration(float pct) {
+  return pct >= UNHEALTHY_PCT ? 2 : pct >= ATTENTION_PCT ? 1 : 0;
+}
+
+/** A percentage for people: "13%", or "under 1%" for a little more than none. */
+static String percent(float v) {
+  if (v > 0 && v < 0.5f) return "under 1%";
+  return decimal(v, 0) + "%";
+}
+
+/** The status and the numbers in plain words, or why there are none. */
+static String resultText(const VisionResult &r, const char *error) {
+  if (error) return String(ICON_UNKNOWN "Can't tell\nThe photo could not be measured: ") + error + ".";
+  if (r.issues) {
+    String t = ICON_UNKNOWN "Can't tell";
+    if (r.issues & VISION_TOO_DARK) t += "\nThe photo is too dark: turn on a light near the plant.";
+    if (r.issues & VISION_TOO_BRIGHT) t += "\nThe photo is too bright: keep direct sun off the plant.";
+    if (r.issues & VISION_BLURRY) t += "\nThe photo is blurry: check the camera's focus, and that it does not move.";
+    return t;
+  }
+  // Yellow/brown alone can be a dead plant, but also a table or the room: do not call it Unhealthy.
+  if (r.leafPixels == 0) return ICON_UNKNOWN "No green leaves found\nCheck that the camera points at the plant. If it does, the plant may be dry or dead.";
+  int s = statusFromDiscoloration(r.discolorationPct);
+  String t = String(STATUS_ICONS[s]) + STATUS_LABELS[s] + "\n" + STATUS_LINES[s];
+  t += "\n\nGreen leaves: " + percent(r.coverPct) + " of the picture";
+  t += "\nYellow or brown: " + percent(r.discolorationPct) + " of the plant";
+  return t;
+}
+
+// ---- Reports ----
+
+/** The caption: camera, local time, `note` ("Test report", "Sent 20 min late"), then `text`. */
+static String reportCaption(const String &note, const String &text) {
+  String c = "\xF0\x9F\x8C\xB1 ";  // seedling emoji
+  c += deviceName;
+  c += "\n";
+  c += clockValid() ? formatLocal(localMinutes()) : String("Time not known yet");
+  if (note.length()) c += "\n" + note;
+  c += "\n\n" + text;
+  return c;
+}
+
+/** Telegram and WiFi are ready; otherwise a status, and how the report ends in `result`. */
+static bool canReport(bool quiet, ReportResult &result) {
   if (!telegramReady()) {
     reportStatus("error:Telegram is not set up", quiet);
-    return REPORT_REFUSED;
+    result = REPORT_REFUSED;
+    return false;
   }
   if (WiFi.status() != WL_CONNECTED) {
     reportStatus("error:the camera is not on WiFi", quiet);
-    return REPORT_FAILED;
+    result = REPORT_FAILED;
+    return false;
   }
+  return true;
+}
+
+/** Take a photo into `jpeg`; if the camera fails, tell the chat and say in `result` how the report ends. */
+static bool photoForReport(bool quiet, ReportResult &result) {
+  if (takePhoto(quiet)) return true;
+  result = REPORT_FAILED;
+  if (restartWhenIdle) return false;  // out of memory: sent after the restart
+  // Tell the chat, so a broken camera does not go unnoticed.
   String error;
-  if (!takePhoto(quiet)) {
-    if (restartWhenIdle) return REPORT_FAILED;  // out of memory: sent after the restart
-    // Tell the chat, so a broken camera does not go unnoticed.
-    telegramPost("sendMessage", formField("chat_id", tgChat) + formField("text", String(deviceName) + ": the camera could not take the photo. Check the ribbon cable, then restart the camera."), nullptr, 0, error);
-    return REPORT_REFUSED;
-  }
-  if (!quiet) setStatus("sending");
-  stopCamera();  // its internal RAM goes to WiFi and TCP during the upload
-  int code = telegramPost("sendPhoto", formField("chat_id", tgChat) + formField("caption", reportCaption(note)), jpeg, jpegLen, error);
-  Serial.printf("[telegram] sendPhoto, %u bytes: %d %s\n", (unsigned)jpegLen, code, error.c_str());
+  telegramPost("sendMessage", formField("chat_id", tgChat) + formField("text", String(deviceName) + ": the camera could not take the photo. Check the ribbon cable, then restart the camera."), nullptr, 0, error);
+  result = REPORT_REFUSED;
+  return false;
+}
+
+/** Send the picture (or, without one, the photo in `jpeg`) with `caption`. Returns the HTTP status. */
+static int uploadReport(const String &caption, String &error) {
+  Serial.printf("[report] caption:\n%s\n[report] end of caption\n", caption.c_str());
+  Upload file = pictureJpeg ? Upload{"photo", pictureJpeg, pictureLen} : Upload{"photo", jpeg, jpegLen};
+  int code = telegramPost("sendPhoto", formField("chat_id", tgChat) + formField("caption", caption), &file, 1, error);
+  Serial.printf("[telegram] sendPhoto, %u bytes: %d %s\n", (unsigned)file.len, code, error.c_str());
+  return code;
+}
+
+/**
+ * After the upload: the camera back on, and how the report ended. REPORT_REFUSED means trying
+ * again would not help (wrong token or chat).
+ */
+static ReportResult finishReport(int code, const String &error, bool quiet) {
   if (startCamera() != ESP_OK) restartWhenIdle = true;
   logHeap("after the report");
   if (code == 200) {
@@ -610,8 +760,60 @@ static ReportResult sendReport(bool quiet, const String &note) {
   return code >= 400 && code < 500 && code != 429 ? REPORT_REFUSED : REPORT_FAILED;
 }
 
-/** The latest scheduled time at or before `nowMin` (local minutes since 1970), or 0 if none this week. */
+/**
+ * The shot the report uses: of the good ones (measured, no photo problem), the middle one by leaf
+ * cover; with none good, the last one, to say what was wrong with it.
+ */
+static int pickShot(const Shot *shots, int count) {
+  int good[PHOTOS_PER_REPORT], n = 0;
+  for (int i = 0; i < count; i++)
+    if (!shots[i].error && !shots[i].r.issues) good[n++] = i;
+  if (!n) return count - 1;
+  for (int i = 1; i < n; i++) {  // sort by leaf cover (a few: insertion sort)
+    for (int j = i; j > 0 && shots[good[j]].r.coverPct < shots[good[j - 1]].r.coverPct; j--) {
+      int t = good[j];
+      good[j] = good[j - 1];
+      good[j - 1] = t;
+    }
+  }
+  return good[(n - 1) / 2];
+}
+
+/**
+ * Take PHOTOS_PER_REPORT photos one after the other (or, without `newPhoto`, analyze the one in
+ * `jpeg` once) and send the middle one's picture and result to the Telegram chat. `quiet` (a
+ * scheduled report) shows the progress in the serial log only.
+ */
+static ReportResult sendReport(bool quiet, const String &note, bool newPhoto) {
+  ReportResult result;
+  if (!canReport(quiet, result)) return result;
+  Shot shots[PHOTOS_PER_REPORT];
+  int count = 0;
+  while (count < (newPhoto ? PHOTOS_PER_REPORT : 1)) {
+    if (newPhoto && !photoForReport(quiet, result)) {
+      for (int i = 0; i < count; i++) heap_caps_free(shots[i].picture);
+      return result;
+    }
+    if (!quiet) setStatus("analyzing");
+    analyzePhoto(shots[count++]);  // the camera stays stopped until after the upload
+  }
+  int pick = pickShot(shots, count);
+  Serial.printf("[report] using photo %d of %d\n", pick + 1, count);
+  for (int i = 0; i < count; i++)
+    if (i != pick) heap_caps_free(shots[i].picture);
+  keepPicture(shots[pick]);
+  if (!quiet) setStatus("sending");
+  String error;
+  int code = uploadReport(reportCaption(note, resultText(shots[pick].r, shots[pick].error)), error);
+  return finishReport(code, error, quiet);
+}
+
+/**
+ * The latest scheduled time at or before `nowMin` (local minutes since 1970): a multiple of
+ * schedEvery (so from midnight when it divides a day), or the set time on a set day this week; 0 if none.
+ */
 static uint32_t latestSlot(int64_t nowMin) {
+  if (schedEvery) return (uint32_t)(nowMin / schedEvery * schedEvery);
   int64_t today = nowMin / 1440;
   for (int k = 0; k <= 7; k++) {
     int64_t day = today - k;
@@ -639,18 +841,15 @@ static void serviceSchedule() {
   }
   if (!slot || slot <= lastSlot) return;
   int32_t late = (int32_t)(now - slot);
-  if (late > LATE_LIMIT_MIN) return;  // missed while the camera was off, and too long ago now
+  if (late > (schedEvery ? LATE_AFTER_MIN : LATE_LIMIT_MIN)) return;  // missed while the camera was off, and too long ago now
   if (!telegramReady() || WiFi.status() != WL_CONNECTED || (int32_t)(millis() - nextReportTryAt) < 0) return;
 
   String note;
-  if (late > LATE_AFTER_MIN) {
-    char at[8];
-    snprintf(at, sizeof(at), "%u:%02u", schedMinute / 60, schedMinute % 60);
-    note = "Sent " + String(late) + " min late: the camera was off or offline at " + at + ".";
-  }
+  if (late > LATE_AFTER_MIN) note = "Sent " + String(late) + " min late: the camera was off or offline at " + formatClock(slot % 1440) + ".";
   Serial.printf("[report] scheduled for %s\n", formatLocal(slot).c_str());
-  ReportResult result = sendReport(true, note);
-  if (result == REPORT_FAILED) nextReportTryAt = millis() + REPORT_RETRY_MS;
+  ReportResult result = sendReport(true, note, true);
+  uint32_t retryMs = schedEvery && schedEvery * 60000UL < REPORT_RETRY_MS ? schedEvery * 60000UL : REPORT_RETRY_MS;
+  if (result == REPORT_FAILED) nextReportTryAt = millis() + retryMs;
   else markHandled(slot);
 }
 
@@ -839,7 +1038,7 @@ static void handleCommand(const char *text) {
     updateInfo();
     setStatus("ready");
   } else if (strcmp(text, "report") == 0) {
-    sendReport(false, "Test report");
+    sendReport(false, "Test report", true);
   } else {
     setStatus("error:unknown command");
   }
@@ -855,7 +1054,7 @@ void setup() {
   commands = xQueueCreate(8, sizeof(Command));
 
   prefs.begin("plantcam", false);
-  for (const char *old : {"server", "key", "frame", "led"}) prefs.remove(old);  // firmware 2 settings
+  for (const char *old : {"server", "key", "frame", "led", "blcount", "blsum", "blcover"}) prefs.remove(old);  // older firmware's settings
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
   tgToken = prefs.getString("tgtoken", "");
@@ -863,6 +1062,7 @@ void setup() {
   tgLabel = prefs.getString("tglabel", "");
   schedDays = prefs.getUChar("sdays", 0);
   schedMinute = prefs.getUShort("stime", 7 * 60);
+  schedEvery = prefs.getUShort("severy", 0);
   schedOffset = prefs.getShort("soff", 0);
   lastSlot = prefs.getUInt("lastslot", 0);
 
@@ -909,7 +1109,96 @@ void setup() {
   }
 }
 
-/** The same commands typed in the serial monitor (one per line), plus "heap". */
+// ---- Serial commands for testing the analysis ----
+
+/** Serial "analyze": take a photo and analyze it, without sending it. */
+static void analyzeNow() {
+  Shot s;
+  if (takePhoto(true)) {
+    analyzePhoto(s);
+    keepPicture(s);
+  }
+  if (startCamera() != ESP_OK) restartWhenIdle = true;
+}
+
+/** Read the `len` bytes of a JPEG that follow "analyze:<bytes>" or "report-file:<bytes>" into `jpeg`. */
+static bool receiveJpeg(long len) {
+  if (len <= 0 || len > 4L * 1024 * 1024) {
+    Serial.println("[analysis] failed: give the JPEG's size in bytes");
+    return false;
+  }
+  if ((size_t)len > jpegCap) {
+    free(jpeg);
+    jpegCap = len;
+    jpeg = (uint8_t *)ps_malloc(jpegCap);
+  }
+  if (!jpeg) {
+    jpegCap = 0;
+    Serial.println("[analysis] failed: out of memory");
+    return false;
+  }
+  size_t got = 0;
+  uint32_t last = millis();
+  while (got < (size_t)len && millis() - last < 3000) {
+    int c = Serial.peek();
+    if (c < 0) {
+      delay(1);
+      continue;
+    }
+    last = millis();
+    if (got == 0 && (c == '\r' || c == '\n')) {  // the end of the command line
+      Serial.read();
+      continue;
+    }
+    got += Serial.read(jpeg + got, min((size_t)Serial.available(), (size_t)len - got));
+  }
+  jpegLen = got;
+  if (got < (size_t)len) {
+    Serial.printf("[analysis] failed: received %u of %ld bytes\n", (unsigned)got, len);
+    return false;
+  }
+  return true;
+}
+
+/** Serial "analyze:<bytes>", then that many bytes of a JPEG: analyze it as if the camera had taken it. */
+static void analyzeUpload(long len) {
+  if (!receiveJpeg(len)) return;
+  Shot s;
+  analyzePhoto(s);
+  keepPicture(s);
+  if (startCamera() != ESP_OK) restartWhenIdle = true;
+}
+
+/** Serial "report-file:<bytes>", then a JPEG: a whole report with it instead of photos. */
+static void reportUpload(long len) {
+  if (receiveJpeg(len)) sendReport(true, "Test report with an uploaded image", false);
+}
+
+/** Serial "jpeg" / "picture": the last photo or the last picture in base64, to look at it on the PC. */
+static void printBase64(const uint8_t *data, size_t len) {
+  static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  Serial.printf("[jpeg] begin %u\n", (unsigned)len);
+  char out[77];
+  int col = 0;
+  for (size_t i = 0; i < len; i += 3) {
+    uint32_t v = (uint32_t)data[i] << 16 | (i + 1 < len ? data[i + 1] << 8 : 0) | (i + 2 < len ? data[i + 2] : 0);
+    out[col++] = B64[v >> 18 & 63];
+    out[col++] = B64[v >> 12 & 63];
+    out[col++] = i + 1 < len ? B64[v >> 6 & 63] : '=';
+    out[col++] = i + 2 < len ? B64[v & 63] : '=';
+    if (col == 76 || i + 3 >= len) {
+      out[col] = 0;
+      Serial.println(out);
+      col = 0;
+    }
+  }
+  Serial.println("[jpeg] end");
+}
+
+/**
+ * The same commands typed in the serial monitor (one per line), plus "heap", "analyze",
+ * "analyze:<bytes>", "report-file:<bytes>", "jpeg" and "picture".
+ */
 static void serviceSerial() {
   static String line;
   while (Serial.available()) {
@@ -919,6 +1208,11 @@ static void serviceSerial() {
       continue;
     }
     if (line == "heap") logHeap("now");
+    else if (line == "analyze") analyzeNow();
+    else if (line.startsWith("analyze:")) analyzeUpload(line.substring(8).toInt());
+    else if (line.startsWith("report-file:")) reportUpload(line.substring(12).toInt());
+    else if (line == "jpeg") printBase64(jpeg, jpegLen);
+    else if (line == "picture") printBase64(pictureJpeg, pictureLen);
     else if (line.length()) handleCommand(line.c_str());
     line = "";
   }

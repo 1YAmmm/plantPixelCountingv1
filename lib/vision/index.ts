@@ -7,7 +7,6 @@ export * from "./geometry";
 export * from "./white-balance";
 export * from "./roi";
 export * from "./classify";
-export * from "./region";
 export * from "./measure";
 export * from "./quality";
 export * from "./overlay";
