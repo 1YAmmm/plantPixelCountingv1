@@ -37,9 +37,8 @@ export async function prepareImage(input: Buffer, maxLongEdge: number | null): P
 }
 
 /**
- * The centred guide square of a full camera photo, scaled to SQUARE_PX × SQUARE_PX: the server
- * version of fileToSquare() in lib/browser/image.ts, for photos the ESP32-CAM uploads by itself, so
- * they are framed exactly like the ones (and the baseline) taken over Bluetooth.
+ * The centred guide square of a full camera photo, scaled to SQUARE_PX × SQUARE_PX: the reference
+ * for the crop the camera's firmware does before analyzing, so every photo is framed the same way.
  */
 export async function cropGuideSquare(input: Buffer): Promise<Buffer> {
   const { autoOrient } = await sharp(input, { failOn: "error" }).metadata();

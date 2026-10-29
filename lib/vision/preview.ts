@@ -54,16 +54,3 @@ export function previewAnalyze(img: RgbImage, settings: VisionSettings): Preview
     issues: imageQualityIssues({ brightnessPct, sharpness }, settings.quality),
   };
 }
-
-/** What the browser computes, by name, so it can run in a Web Worker (see preview.worker.ts). */
-export const PREVIEW_JOBS = {
-  /** Preview step: mask, estimated cover and quality checks. */
-  preview: previewAnalyze,
-  /** Settings page: mask and counts only (skips the sharpness check, half the work). */
-  mask: (img: RgbImage, settings: VisionSettings) => maskPreview(img, settings),
-  /** Live camera view: leaf mask of a small frame of the square. */
-  live: (img: RgbImage, settings: VisionSettings) => maskPreview(img, settings, false),
-};
-
-export type PreviewJob = keyof typeof PREVIEW_JOBS;
-export type PreviewJobResult<J extends PreviewJob> = ReturnType<(typeof PREVIEW_JOBS)[J]>;
