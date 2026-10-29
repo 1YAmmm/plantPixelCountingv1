@@ -1,18 +1,17 @@
-// Plant Pixel Counter: AI-Thinker ESP32-CAM as a Bluetooth (BLE) camera, plan §11.3, that also
-// takes the daily report photo over WiFi by itself (newplan.md step 8).
+// PlantCam: an AI-Thinker ESP32-CAM that photographs a plant on a schedule and sends the report to
+// Telegram by itself. The web app only sets it up over Bluetooth (BLE): the WiFi, the Telegram bot
+// token and chat, and the days and time of the report, all kept in flash. The commands and the Info
+// JSON are described in lib/ble/protocol.ts; keep the two in sync (tests/ble-protocol.test.ts
+// checks the UUIDs and the command names).
 //
 // Board: "AI Thinker ESP32-CAM" (esp32:esp32:esp32cam, core 3.x), partition "Huge APP", PSRAM.
-// The web app (Analyze → ESP32-CAM) connects with Web Bluetooth, writes "capture" to Control and
-// receives the JPEG on Data as START, CHUNK…, END packets. "preview" does the same with a small
-// QVGA frame, which the browser requests back to back for its live view. The wire format is described in
-// lib/ble/protocol.ts; keep the two in sync (tests/ble-protocol.test.ts checks the UUIDs).
+// The clock comes from the internet (SNTP) once on WiFi; the schedule is in the camera's local
+// time, a fixed UTC offset sent by the web app. loop() does one thing at a time, so BLE commands
+// and reports never use the camera together.
 //
-// Daily report: the Settings page sends the WiFi, the server address and the device key over BLE
-// ("wifi-ssid:", "wifi-pass:", "server:", "key:", then "wifi:connect"); they are kept in flash.
-// On WiFi, the board asks the server every minute (GET /api/device/config) whether to take a
-// photo. When told "capture=<slot>", it takes one and POSTs it (/api/device/captures). The server
-// keeps the schedule, so the board needs no clock. loop() does one thing at a time, so BLE
-// commands and uploads never use the camera together.
+// Instruction RAM (IRAM) is nearly full: BLE, WiFi and the PSRAM cache workaround, which also puts
+// libc's time functions in IRAM. So no time()/localtime()/strftime(): dates are computed here from
+// gettimeofday(). The TLS buffers go to PSRAM, so HTTPS to Telegram fits next to BLE and WiFi.
 
 #include <Arduino.h>
 #include <BLE2902.h>
@@ -21,23 +20,22 @@
 #include <NetworkClientSecure.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <sys/time.h>
 #include "esp_camera.h"
 #include "esp_gatt_common_api.h"
 #include "esp_heap_caps.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
+#include "lwip/apps/sntp.h"
+#include "lwip/priv/tcpip_priv.h"
+#include "mbedtls/platform.h"
 
-#define FIRMWARE_VERSION "2.0.0"
+#define FIRMWARE_VERSION "3.0.0"
 
 #define SERVICE_UUID "7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define CONTROL_UUID "7a1e0001-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define STATUS_UUID "7a1e0002-5c3b-4d2a-8f1e-3b9c6d4a2e10"
-#define DATA_UUID "7a1e0003-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define INFO_UUID "7a1e0004-5c3b-4d2a-8f1e-3b9c6d4a2e10"
-
-// Data packet types (first byte of every Data notification).
-static const uint8_t PKT_START = 0x01;  // u32 size, u16 chunks, u32 crc32, u16 chunk size, u16 width, u16 height, u16 capture id
-static const uint8_t PKT_CHUNK = 0x02;  // u16 seq, payload
-static const uint8_t PKT_END = 0x03;    // u16 chunks, u16 capture id
 
 // AI-Thinker ESP32-CAM pins.
 #define PWDN_GPIO_NUM 32
@@ -58,106 +56,70 @@ static const uint8_t PKT_END = 0x03;    // u16 chunks, u16 capture id
 #define PCLK_GPIO_NUM 22
 #define LED_GPIO_NUM 4
 
-static const int JPEG_QUALITY = 12;  // 10–63, lower is better quality and a bigger file
-static const uint32_t SEND_TIMEOUT_MS = 3000;
+#define TELEGRAM_HOST "api.telegram.org"
+#define BOUNDARY "PlantCamFormBoundary7MA4YWxk"
 
-struct FrameOption {
-  const char *name;
-  framesize_t size;
-};
-// Largest first: the camera is initialised at the largest size so every option fits the buffer.
-static const FrameOption FRAMES[] = {
-  {"UXGA", FRAMESIZE_UXGA}, {"SXGA", FRAMESIZE_SXGA}, {"XGA", FRAMESIZE_XGA}, {"SVGA", FRAMESIZE_SVGA}, {"VGA", FRAMESIZE_VGA}, {"QVGA", FRAMESIZE_QVGA},
-};
-static const int FRAME_COUNT = sizeof(FRAMES) / sizeof(FRAMES[0]);
-// Live preview frames: small enough for a few frames a second over BLE (about 5 KB each).
-static const framesize_t PREVIEW_SIZE = FRAMESIZE_QVGA;
-// The LED stays on this long after the last photo, so a live preview with the LED does not flicker.
-static const uint32_t LED_HOLD_MS = 1500;
+static const int JPEG_QUALITY = 12;                 // 10–63, lower is better quality and a bigger file
+static const framesize_t PHOTO_SIZE = FRAMESIZE_SXGA;  // 1280 × 1024: sharp enough for the 1000 px guide square
 
-// Daily report over WiFi.
-static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-static const uint32_t WIFI_RETRY_MS = 60000;      // begin() again if still not connected
-static const uint32_t POLL_TIMEOUT_MS = 20000;
-static const uint32_t UPLOAD_TIMEOUT_MS = 60000;  // the server analyzes the photo and emails it before replying
-static const int UPLOAD_ATTEMPTS = 3;
-static const uint32_t UPLOAD_RETRY_MS = 20000;
-static const uint32_t RESTART_AFTER_MS = 30UL * 60 * 1000;  // no successful poll for this long: restart
+static const uint32_t WIFI_ATTEMPT_MS = 12000;  // per attempt of "wifi:connect" (the web app waits 20 s per status)
+static const int WIFI_ATTEMPTS = 2;             // BLE shares the radio: the first scan sometimes misses the network
+static const uint32_t WIFI_RETRY_MS = 60000;    // begin() again if still not connected
+static const uint32_t RESTART_AFTER_MS = 30UL * 60 * 1000;  // WiFi set up but down this long, nobody on BLE: restart
+static const uint32_t HTTP_TIMEOUT_MS = 30000;
+static const uint32_t REPORT_RETRY_MS = 5UL * 60 * 1000;  // a report that could not reach Telegram
+static const int32_t LATE_LIMIT_MIN = 180;  // a report missed at the set time (power, WiFi) is still sent this long after
+static const int32_t LATE_AFTER_MIN = 15;   // and is marked late after this
+static const time_t CLOCK_VALID_AFTER = 1704067200;  // 2024-01-01: an earlier clock was never set
+static const size_t MAX_LABEL_BYTES = 120;
+static const uint32_t CAMERA_SETTLE_MS = 1500;  // auto exposure and white balance after a start
 
 struct Command {
-  char text[200];  // long enough for "server:<url>" and "key:<device key>"
+  char text[200];  // long enough for "tg-label:<label>" and "wifi-pass:<password>"
 };
 
-/** The server address split up: "http[s]://host[:port][/base path]". Up here for the .ino prototypes. */
-struct ServerAddress {
-  bool https = false;
-  String host;
-  uint16_t port = 0;
-  String base;
-};
+/** How a report ended. Up here for the .ino prototypes. */
+enum ReportResult { REPORT_SENT, REPORT_FAILED, REPORT_REFUSED };
 
 static BLEServer *server = nullptr;
 static BLECharacteristic *statusChar = nullptr;
-static BLECharacteristic *dataChar = nullptr;
 static BLECharacteristic *infoChar = nullptr;
 static QueueHandle_t commands = nullptr;
 static Preferences prefs;
+static char deviceName[20];
 
 static volatile bool connected = false;
-static volatile uint16_t connId = 0;
-static volatile bool notifyFailed = false;
+static bool cameraOk = false;       // found at boot
+static bool cameraRunning = false;  // the driver is started (stopped during uploads)
+static uint32_t cameraStartedAt = 0;
+static bool restartWhenIdle = false;  // the internal RAM ran out: restart once nobody is on BLE
 
-static int frameIndex = 1;  // SXGA: sharp enough for the 1000 px square, about 3 s over BLE
-static uint8_t ledLevel = 0;
-static bool cameraOk = false;
-static framesize_t sensorSize = FRAMESIZE_INVALID;
-static bool ledOn = false;
-static uint32_t ledOffAt = 0;
-
-// The last JPEG, kept so lost chunks can be resent without taking a new photo.
+// The last photo, in PSRAM.
 static uint8_t *jpeg = nullptr;
 static size_t jpegLen = 0;
 static size_t jpegCap = 0;
-static uint16_t jpegWidth = 0;
-static uint16_t jpegHeight = 0;
-static uint32_t jpegCrc = 0;
-static uint16_t captureId = 0;
-static uint16_t chunkSize = 0;
-static uint16_t chunkCount = 0;
 
-// WiFi and server settings (Preferences), and the poll state.
+// Settings (Preferences).
 static String wifiSsid;
 static String wifiPass;
-static String serverUrl;
-static String deviceKey;
+static String tgToken;
+static String tgChat;
+static String tgLabel;
+static uint8_t schedDays = 0;      // bit 0 = Sunday … bit 6 = Saturday; 0 = no reports
+static uint16_t schedMinute = 0;   // minute of the day, local time
+static int16_t schedOffset = 0;    // local time = UTC + this many minutes
+static uint32_t lastSlot = 0;      // the last scheduled time handled, local minutes since 1970
+static bool skipPastSlots = false; // a new schedule starts with its next time, not one already past today
+
+// WiFi and clock state.
 static bool wifiDirty = false;  // a new name or password since the last "wifi:connect"
 static bool wifiWasUp = false;
-static bool pollNow = false;
-static uint32_t pollMs = 60000;
-static uint32_t nextPollAt = 0;
-static uint32_t lastPollOkAt = 0;
 static uint32_t lastWifiAttemptAt = 0;
-static bool tlsChecked = false;
+static uint32_t wifiDownSince = 0;
 static volatile uint16_t lastDisconnectReason = 0;
-
-/** CRC-32 (IEEE 802.3, the zlib one), the same as crc32() in lib/ble/protocol.ts. */
-static uint32_t crc32(const uint8_t *data, size_t len) {
-  uint32_t crc = 0xFFFFFFFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
-  }
-  return ~crc;
-}
-
-static void putU16(uint8_t *p, uint16_t v) {
-  p[0] = v & 0xFF;
-  p[1] = v >> 8;
-}
-
-static void putU32(uint8_t *p, uint32_t v) {
-  for (int i = 0; i < 4; i++) p[i] = (v >> (8 * i)) & 0xFF;
-}
+static bool clockStarted = false;
+static bool clockWasValid = false;
+static uint32_t nextReportTryAt = 0;
 
 static void setStatus(const String &status) {
   Serial.printf("[status] %s\n", status.c_str());
@@ -165,7 +127,93 @@ static void setStatus(const String &status) {
   if (connected) statusChar->notify();
 }
 
-/** A JSON string literal (the WiFi name may contain quotes or backslashes). */
+static void logHeap(const char *when) {
+  Serial.printf(
+    "[heap] %s: internal free %u, largest block %u, PSRAM free %u\n", when, (unsigned)ESP.getFreeHeap(),
+    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL), (unsigned)ESP.getFreePsram()
+  );
+}
+
+// ---- Clock and dates (no libc time functions: see the top) ----
+
+static time_t nowUtc() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return tv.tv_sec;
+}
+
+static bool clockValid() {
+  return nowUtc() > CLOCK_VALID_AFTER;
+}
+
+/** The camera's local time in minutes since 1970-01-01 00:00. */
+static int64_t localMinutes() {
+  return (int64_t)nowUtc() / 60 + schedOffset;
+}
+
+/** 0 = Sunday, like the schedule's bits (1970-01-01 was a Thursday). */
+static int weekday(int64_t day) {
+  return (int)((day + 4) % 7);
+}
+
+/** Year, month (1–12) and day of `days` since 1970-01-01 (H. Hinnant's civil_from_days). */
+static void civilFromDays(int64_t days, int &y, unsigned &m, unsigned &d) {
+  days += 719468;
+  const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+  const unsigned doe = (unsigned)(days - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  d = doy - (153 * mp + 2) / 5 + 1;
+  m = mp < 10 ? mp + 3 : mp - 9;
+  y = (int)(yoe + era * 400 + (m <= 2));
+}
+
+/** "Thu 29 Oct 2026, 7:00" for local minutes since 1970. */
+static String formatLocal(int64_t localMin) {
+  static const char *DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static const char *MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  int64_t day = localMin / 1440;
+  int minute = (int)(localMin % 1440);
+  int y;
+  unsigned m, d;
+  civilFromDays(day, y, m, d);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s %u %s %d, %d:%02d", DAYS[weekday(day)], d, MONTHS[m - 1], y, minute / 60, minute % 60);
+  return buf;
+}
+
+/** 480 → "UTC+8", 330 → "UTC+5:30". */
+static String formatOffset(int offset) {
+  char buf[16];
+  int a = offset < 0 ? -offset : offset;
+  if (a % 60) snprintf(buf, sizeof(buf), "UTC%c%d:%02d", offset < 0 ? '-' : '+', a / 60, a % 60);
+  else snprintf(buf, sizeof(buf), "UTC%c%d", offset < 0 ? '-' : '+', a / 60);
+  return buf;
+}
+
+/** Ask the internet for the time (SNTP, every hour), like the core's configTime() without the time zone. */
+static void startClock() {
+  if (clockStarted) return;
+  clockStarted = true;
+  esp_netif_init();
+#ifdef CONFIG_LWIP_TCPIP_CORE_LOCKING
+  bool locked = !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
+  if (locked) LOCK_TCPIP_CORE();
+#endif
+  sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  sntp_setservername(0, (char *)"pool.ntp.org");
+  sntp_setservername(1, (char *)"time.google.com");
+  sntp_setservername(2, (char *)"time.cloudflare.com");
+  sntp_init();
+#ifdef CONFIG_LWIP_TCPIP_CORE_LOCKING
+  if (locked) UNLOCK_TCPIP_CORE();
+#endif
+}
+
+// ---- Info and settings ----
+
+/** A JSON string literal (the WiFi name or the label may contain quotes or backslashes). */
 static String jsonString(const String &s) {
   String out = "\"";
   for (size_t i = 0; i < s.length(); i++) {
@@ -184,60 +232,85 @@ static String jsonString(const String &s) {
   return out + "\"";
 }
 
+static bool telegramReady() {
+  return tgToken.length() && tgChat.length();
+}
+
+/** "62,07:00,480" (days, time, UTC offset), as the web app sends it; empty when there is none. */
+static String scheduleText() {
+  if (!schedDays) return String();
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%u,%02u:%02u,%d", schedDays, schedMinute / 60, schedMinute % 60, schedOffset);
+  return buf;
+}
+
 static void updateInfo() {
-  uint16_t mtu = connected ? server->getPeerMTU(connId) : 23;
   bool wifiUp = WiFi.status() == WL_CONNECTED;
-  char json[200];
-  snprintf(
-    json, sizeof(json), "{\"fw\":\"%s\",\"model\":\"AI-Thinker ESP32-CAM\",\"camera\":%s,\"frame\":\"%s\",\"quality\":%d,\"led\":%u,\"psram\":%s,\"mtu\":%u",
-    FIRMWARE_VERSION, cameraOk ? "true" : "false", FRAMES[frameIndex].name, JPEG_QUALITY, ledLevel, psramFound() ? "true" : "false", mtu
-  );
-  String info = json;
+  String info = "{\"fw\":\"" FIRMWARE_VERSION "\",\"model\":\"AI-Thinker ESP32-CAM\",\"camera\":";
+  info += cameraOk ? "true" : "false";
+  info += ",\"psram\":";
+  info += psramFound() ? "true" : "false";
   info += ",\"wifi\":";
   info += wifiUp ? "true" : "false";
   info += ",\"ssid\":" + jsonString(wifiSsid);
   info += ",\"ip\":" + jsonString(wifiUp ? WiFi.localIP().toString() : String());
   if (wifiUp) info += ",\"rssi\":" + String(WiFi.RSSI());
-  info += ",\"server\":";
-  info += serverUrl.length() && deviceKey.length() ? "true" : "false";
+  info += ",\"telegram\":";
+  info += telegramReady() ? "true" : "false";
+  info += ",\"tgLabel\":" + jsonString(tgLabel);
+  info += ",\"schedule\":" + jsonString(scheduleText());
+  info += ",\"clock\":";
+  info += clockValid() ? "true" : "false";
   info += "}";
   infoChar->setValue(info);
 }
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
-    connId = param->connect.conn_id;
-    connected = true;
-    // Ask for a short connection interval (7.5–15 ms): more packets per second. The phone may refuse.
-    s->requestConnParams(param->connect.remote_bda, 6, 12, 0, 400);
-    Serial.printf("[ble] connected (conn %u)\n", connId);
-  }
-  void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *) override {
-    connected = false;
-    Serial.println("[ble] disconnected");
-  }
-  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
-    Serial.printf("[ble] MTU %u\n", param->mtu.mtu);
-  }
-};
+/** "7012345678:AAE…": digits, a colon and the secret. */
+static bool validToken(const char *t) {
+  const char *colon = strchr(t, ':');
+  if (!colon || colon - t < 5 || strlen(colon + 1) < 30) return false;
+  for (const char *p = t; p < colon; p++)
+    if (!isdigit((unsigned char)*p)) return false;
+  for (const char *p = colon + 1; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return false;
+  return true;
+}
 
-class ControlCallbacks : public BLECharacteristicCallbacks {
-  // Runs on the Bluetooth task: only queue the command, loop() does the slow work.
-  void onWrite(BLECharacteristic *c) override {
-    Command cmd = {};
-    String value = c->getValue();
-    strncpy(cmd.text, value.c_str(), sizeof(cmd.text) - 1);
-    if (xQueueSend(commands, &cmd, 0) != pdTRUE) Serial.println("[ble] command queue full");
-  }
-};
+/** A chat id: an integer, negative for groups and channels. */
+static bool validChatId(const char *t) {
+  const char *p = *t == '-' ? t + 1 : t;
+  if (!*p || strlen(p) > 20) return false;
+  for (; *p; p++)
+    if (!isdigit((unsigned char)*p)) return false;
+  return true;
+}
 
-class DataCallbacks : public BLECharacteristicCallbacks {
-  void onStatus(BLECharacteristic *, Status s, uint32_t code) override {
-    if (s != SUCCESS_NOTIFY && s != SUCCESS_INDICATE) notifyFailed = true;
-  }
-};
+/** "schedule:<days>,<HH:MM>,<offset>". */
+static bool saveSchedule(const char *args) {
+  unsigned days, hh, mm;
+  int offset;
+  char end;
+  if (sscanf(args, "%u,%u:%u,%d%c", &days, &hh, &mm, &offset, &end) != 4) return false;
+  if (days > 127 || hh > 23 || mm > 59 || offset < -720 || offset > 840) return false;
+  schedDays = days;
+  schedMinute = hh * 60 + mm;
+  schedOffset = offset;
+  prefs.putUChar("sdays", schedDays);
+  prefs.putUShort("stime", schedMinute);
+  prefs.putShort("soff", schedOffset);
+  skipPastSlots = true;
+  nextReportTryAt = millis();
+  return true;
+}
 
-static bool initCamera() {
+// ---- Camera ----
+
+/**
+ * Start the camera driver. It takes about 43 KB of internal RAM (DMA buffers, its task), which the
+ * upload to Telegram needs next to BLE and WiFi, so sendReport() stops it during the upload.
+ */
+static esp_err_t startCamera() {
+  if (cameraRunning) return ESP_OK;
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -259,7 +332,7 @@ static bool initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_VGA;
+  config.frame_size = psramFound() ? PHOTO_SIZE : FRAMESIZE_VGA;  // without PSRAM only VGA fits
   config.jpeg_quality = JPEG_QUALITY;
   config.fb_count = 1;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
@@ -267,60 +340,50 @@ static bool initCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("[camera] init failed: 0x%x\n", err);
-    return false;
+    Serial.printf("[camera] start failed: 0x%x (%s)\n", err, esp_err_to_name(err));
+    return err;
   }
-  if (!psramFound()) frameIndex = FRAME_COUNT - 1;  // without PSRAM only QVGA/VGA fit; stay small
-  esp_camera_sensor_get()->set_framesize(esp_camera_sensor_get(), FRAMES[frameIndex].size);
-  sensorSize = FRAMES[frameIndex].size;
-  return true;
+  cameraRunning = true;
+  cameraStartedAt = millis();
+  return ESP_OK;
 }
 
-static void setLed(bool on) {
-  ledOn = on && ledLevel > 0;
-  ledcWrite(LED_GPIO_NUM, ledOn ? ledLevel : 0);
+static void stopCamera() {
+  if (!cameraRunning) return;
+  esp_camera_deinit();
+  cameraRunning = false;
 }
 
-/** A status for the BLE client, or only the serial log for a photo nobody over BLE asked for. */
-static void photoStatus(const char *status, bool quiet) {
-  if (quiet) Serial.printf("[camera] %s\n", status);
+/** A status for the BLE client, or only the serial log for a report nobody over BLE asked for. */
+static void reportStatus(const String &status, bool quiet) {
+  if (quiet) Serial.printf("[report] %s\n", status.c_str());
   else setStatus(status);
 }
 
-/**
- * Take a fresh photo into `jpeg`. Returns false (with a status) if the camera failed.
- * A preview reports no status and skips the settling frames, so the live view stays fast.
- * `quiet` (the daily report photo) reports nothing over BLE, so a connected browser is not confused.
- */
-static bool takePhoto(framesize_t size, bool preview, bool quiet = false) {
+/** Take a fresh photo into `jpeg`. Returns false (with a status) if the camera failed. */
+static bool takePhoto(bool quiet) {
   if (!cameraOk) {
-    photoStatus("error:camera not found, check the ribbon cable", quiet);
+    reportStatus("error:camera not found, check the ribbon cable", quiet);
     return false;
   }
-  if (!preview && !quiet) setStatus("capturing");
-  // A photo skips the frame waiting in the buffer (taken at the last request) and one more for
-  // exposure; a new size or the LED just switched on needs a few more to settle.
-  int discard = preview ? 0 : 2;
-  if (size != sensorSize) {
-    esp_camera_sensor_get()->set_framesize(esp_camera_sensor_get(), size);
-    sensorSize = size;
-    discard += 2;
+  if (!quiet) setStatus("capturing");
+  esp_err_t err = startCamera();
+  if (err != ESP_OK) {
+    // Out of memory: the internal RAM is too fragmented to start it again. A restart fixes that,
+    // and a scheduled report is then sent late.
+    if (err == ESP_ERR_NO_MEM) restartWhenIdle = true;
+    reportStatus(err == ESP_ERR_NO_MEM ? "error:out of memory, restart the camera" : "error:the camera did not start, check the ribbon cable", quiet);
+    return false;
   }
-  if (ledLevel > 0) {
-    if (!ledOn) {
-      setLed(true);
-      delay(150);
-      discard += 2;
-    }
-    ledOffAt = millis() + LED_HOLD_MS;
-  }
-  for (int i = 0; i < discard; i++) {
+  // Skip the frame waiting in the buffer (taken at the last request, maybe hours ago) and one more
+  // for the exposure; right after a start, keep skipping until the exposure has settled.
+  for (int i = 0; i < 2 || millis() - cameraStartedAt < CAMERA_SETTLE_MS; i++) {
     camera_fb_t *old = esp_camera_fb_get();
     if (old) esp_camera_fb_return(old);
   }
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    photoStatus("error:capture failed", quiet);
+    reportStatus("error:capture failed", quiet);
     return false;
   }
   if (fb->len > jpegCap) {
@@ -331,197 +394,28 @@ static bool takePhoto(framesize_t size, bool preview, bool quiet = false) {
   if (!jpeg) {
     jpegCap = 0;
     esp_camera_fb_return(fb);
-    photoStatus("error:out of memory", quiet);
+    reportStatus("error:out of memory", quiet);
     return false;
   }
   memcpy(jpeg, fb->buf, fb->len);
   jpegLen = fb->len;
-  jpegWidth = fb->width;
-  jpegHeight = fb->height;
+  Serial.printf("[camera] %ux%u, %u bytes\n", fb->width, fb->height, (unsigned)jpegLen);
   esp_camera_fb_return(fb);
-  jpegCrc = crc32(jpeg, jpegLen);
-  captureId++;
-  if (!preview) Serial.printf("[camera] %ux%u, %u bytes, crc %08lx\n", jpegWidth, jpegHeight, (unsigned)jpegLen, (unsigned long)jpegCrc);
   return true;
 }
 
-/** Notify one Data packet, waiting for room in the Bluetooth controller's buffer. */
-static bool sendPacket(const uint8_t *data, size_t len) {
-  for (int attempt = 0; attempt < 5; attempt++) {
-    uint32_t start = millis();
-    while (esp_ble_get_cur_sendable_packets_num(connId) == 0) {
-      if (!connected || millis() - start > SEND_TIMEOUT_MS) return false;
-      vTaskDelay(1);
-    }
-    if (!connected) return false;
-    notifyFailed = false;
-    dataChar->setValue(data, len);
-    dataChar->notify();
-    if (!notifyFailed) return true;
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
-  return false;
+// ---- Telegram Bot API over HTTPS ----
+// A minimal HTTP/1.1 client: the core's HTTPClient parses cookie dates, which would link libc's
+// time functions into the full IRAM.
+
+/** TLS buffers in PSRAM (internal RAM as a fallback): BLE and WiFi need the internal RAM. */
+static void *tlsCalloc(size_t n, size_t size) {
+  void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
-static bool sendChunk(uint16_t seq) {
-  static uint8_t packet[ESP_GATT_MAX_MTU_SIZE];
-  size_t offset = (size_t)seq * chunkSize;
-  size_t len = min((size_t)chunkSize, jpegLen - offset);
-  packet[0] = PKT_CHUNK;
-  putU16(packet + 1, seq);
-  memcpy(packet + 3, jpeg + offset, len);
-  return sendPacket(packet, len + 3);
-}
-
-static bool sendEnd() {
-  uint8_t packet[5] = {PKT_END};
-  putU16(packet + 1, chunkCount);
-  putU16(packet + 3, captureId);
-  return sendPacket(packet, sizeof(packet));
-}
-
-/** Send the whole photo: START, every chunk, END. A preview frame only reports errors. */
-static void sendPhoto(bool preview) {
-  // Each notification carries MTU − 3 bytes of ATT payload; a chunk uses 3 of them for its header.
-  uint16_t mtu = server->getPeerMTU(connId);
-  chunkSize = max(1, (int)mtu - 3 - 3);
-  chunkCount = (jpegLen + chunkSize - 1) / chunkSize;
-  if (!preview) setStatus("sending");
-  uint32_t started = millis();
-
-  uint8_t start[19] = {PKT_START};
-  putU32(start + 1, jpegLen);
-  putU16(start + 5, chunkCount);
-  putU32(start + 7, jpegCrc);
-  putU16(start + 11, chunkSize);
-  putU16(start + 13, jpegWidth);
-  putU16(start + 15, jpegHeight);
-  putU16(start + 17, captureId);
-  bool ok = sendPacket(start, sizeof(start));
-  for (uint16_t seq = 0; ok && seq < chunkCount; seq++) ok = sendChunk(seq);
-  if (ok) ok = sendEnd();
-
-  if (!connected) return;
-  if (!ok) {
-    setStatus("error:send failed");
-    return;
-  }
-  if (preview) return;
-  unsigned ms = max(1UL, (unsigned long)(millis() - started));
-  Serial.printf("[ble] sent %u chunks of %u bytes in %u ms (%.1f KB/s)\n", chunkCount, chunkSize, ms, jpegLen / 1.024 / ms);
-  setStatus("ready");
-}
-
-/** "resend:<from>:<count>": the browser lost some chunks of the current photo. */
-static void resendChunks(const char *args) {
-  unsigned from = 0, count = 0;
-  if (!jpegLen || sscanf(args, "%u:%u", &from, &count) != 2 || from >= chunkCount) {
-    setStatus("error:nothing to resend");
-    return;
-  }
-  setStatus("sending");
-  bool ok = true;
-  for (unsigned seq = from; ok && seq < from + count && seq < chunkCount; seq++) ok = sendChunk(seq);
-  if (ok) ok = sendEnd();
-  if (connected) setStatus(ok ? "ready" : "error:send failed");
-}
-
-// ---- Daily report over WiFi (newplan.md step 8) ----
-
-static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
-  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastDisconnectReason = info.wifi_sta_disconnected.reason;
-  else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) lastDisconnectReason = 0;
-}
-
-/** Why joining failed, from the last disconnect reason. */
-static const char *wifiFailure(uint16_t reason) {
-  switch (reason) {
-    case WIFI_REASON_NO_AP_FOUND:
-    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
-    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
-    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "network not found";
-    case WIFI_REASON_AUTH_FAIL:
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_MIC_FAILURE: return "wrong password";
-    default: return "timeout";
-  }
-}
-
-static void beginWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  lastDisconnectReason = 0;
-  lastWifiAttemptAt = millis();
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-}
-
-/** "wifi:connect": join the saved WiFi, waiting up to 15 s, and say why if it fails. */
-static void connectWifi() {
-  if (wifiSsid.isEmpty()) {
-    setStatus("error:no WiFi name saved");
-    return;
-  }
-  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == wifiSsid && !wifiDirty) {
-    pollNow = true;  // the server address or key may be new: check in now
-    updateInfo();
-    setStatus("ready");
-    return;
-  }
-  setStatus("connecting");
-  WiFi.disconnect();
-  delay(200);
-  beginWifi();
-  wifiDirty = false;
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) delay(100);
-  updateInfo();
-  if (WiFi.status() != WL_CONNECTED) {
-    const char *reason = wifiFailure(lastDisconnectReason);
-    Serial.printf("[wifi] could not join %s: %s (reason %u)\n", wifiSsid.c_str(), reason, lastDisconnectReason);
-    setStatus(String("error:") + reason);
-    return;
-  }
-  Serial.printf("[wifi] joined %s, IP %s, %d dBm\n", wifiSsid.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  wifiWasUp = true;
-  pollNow = true;
-  setStatus("ready");
-}
-
-static void forgetWifi() {
-  wifiSsid = "";
-  wifiPass = "";
-  prefs.remove("ssid");
-  prefs.remove("pass");
-  WiFi.disconnect(true);
-  wifiWasUp = false;
-  updateInfo();
-  setStatus("ready");
-}
-
-static void logHeap(const char *when) {
-  Serial.printf(
-    "[heap] %s: internal free %u, largest block %u, PSRAM free %u\n", when, (unsigned)ESP.getFreeHeap(),
-    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL), (unsigned)ESP.getFreePsram()
-  );
-}
-
-// A minimal HTTP/1.1 client. The core's HTTPClient parses cookie dates, which links libc's time
-// functions into IRAM, and with BLE, WiFi and the PSRAM workaround IRAM is already full.
-
-static bool parseServer(const String &url, ServerAddress &out) {
-  out.https = url.startsWith("https://");
-  if (!out.https && !url.startsWith("http://")) return false;
-  String rest = url.substring(out.https ? 8 : 7);
-  int slash = rest.indexOf('/');
-  String hostPort = slash < 0 ? rest : rest.substring(0, slash);
-  out.base = slash < 0 ? String() : rest.substring(slash);
-  int colon = hostPort.lastIndexOf(':');
-  out.host = colon < 0 ? hostPort : hostPort.substring(0, colon);
-  long port = colon < 0 ? (out.https ? 443 : 80) : hostPort.substring(colon + 1).toInt();
-  if (out.host.isEmpty() || port <= 0 || port > 65535) return false;
-  out.port = port;
-  return true;
+static void tlsFree(void *p) {
+  heap_caps_free(p);
 }
 
 /** One line of the reply (without CR LF), waiting until `deadline`. */
@@ -561,163 +455,341 @@ static void readBody(NetworkClient &c, String &body, long len, uint32_t deadline
   }
 }
 
-/**
- * One request to the server with the device key (Connection: close). Returns the HTTP status, or a
- * negative number when the server could not be reached, and the start of the reply body in `reply`.
- * HTTPS checks the server's certificate with the core's root certificate bundle; plain HTTP is for
- * local testing.
- */
-static int httpRequest(const char *method, const String &path, const String &headers, const uint8_t *body, size_t bodyLen, uint32_t timeoutMs, String &reply) {
-  static NetworkClientSecure *secure = nullptr;
-  static NetworkClient plain;
-  reply = "";
-  ServerAddress a;
-  if (!parseServer(serverUrl, a)) {
-    reply = "invalid server address";
-    return -1;
-  }
-  if (a.https && !secure) {
-    secure = new NetworkClientSecure();
-    secure->useBuiltinCACertBundle();
-  }
-  NetworkClient &c = a.https ? *secure : plain;
-  if (!c.connect(a.host.c_str(), a.port, 10000)) {
-    reply = a.https ? "could not connect (or TLS failed)" : "could not connect";
-    return -2;
-  }
-  String head = String(method) + " " + a.base + path + " HTTP/1.1\r\nHost: " + a.host;
-  if (a.port != (a.https ? 443 : 80)) head += ":" + String(a.port);
-  head += "\r\nUser-Agent: PlantCam/" FIRMWARE_VERSION "\r\nAuthorization: Bearer " + deviceKey + "\r\nConnection: close\r\n" + headers;
-  head += "Content-Length: " + String((unsigned)bodyLen) + "\r\n\r\n";
-  bool ok = c.write((const uint8_t *)head.c_str(), head.length()) == head.length();
-  for (size_t sent = 0; ok && sent < bodyLen;) {
-    size_t n = c.write(body + sent, min((size_t)4096, bodyLen - sent));
-    ok = n > 0;
+static bool writeAll(NetworkClient &c, const uint8_t *data, size_t len) {
+  for (size_t sent = 0; sent < len;) {
+    size_t n = c.write(data + sent, min((size_t)4096, len - sent));
+    if (n == 0) return false;
     sent += n;
   }
-  if (!ok) {
-    c.stop();
-    reply = "send failed";
+  return true;
+}
+
+static bool writeAll(NetworkClient &c, const String &s) {
+  return writeAll(c, (const uint8_t *)s.c_str(), s.length());
+}
+
+static String formField(const char *name, const String &value) {
+  return String("--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"") + name + "\"\r\n\r\n" + value + "\r\n";
+}
+
+/** Telegram's "description" in an error reply. */
+static String jsonDescription(const String &body) {
+  int start = body.indexOf("\"description\":\"");
+  if (start < 0) return String();
+  String out;
+  for (int i = start + 15; i < (int)body.length(); i++) {
+    char c = body[i];
+    if (c == '"') break;
+    if (c == '\\' && i + 1 < (int)body.length()) c = body[++i];
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * POST `fields` (form fields from formField()) and an optional JPEG as "photo" to the Bot API
+ * method. Returns the HTTP status, or a negative number when Telegram could not be reached, with
+ * the reason in `error`. The certificate is checked with the core's root certificate bundle.
+ */
+static int telegramPost(const char *method, const String &fields, const uint8_t *photo, size_t photoLen, String &error) {
+  static NetworkClientSecure *tls = nullptr;
+  static bool heapLogged = false;
+  if (!tls) {
+    tls = new NetworkClientSecure();
+    tls->useBuiltinCACertBundle();
+  }
+  error = "";
+  if (!heapLogged) logHeap("before the first TLS handshake");
+  if (!tls->connect(TELEGRAM_HOST, 443, 15000)) {
+    char buf[100] = "";
+    tls->lastError(buf, sizeof(buf));
+    error = buf[0] ? buf : "no connection";
+    Serial.printf("[telegram] could not connect: %s\n", error.c_str());
+    if (!heapLogged) logHeap("after a FAILED TLS handshake");
+    return -1;
+  }
+  if (!heapLogged) {
+    heapLogged = true;
+    logHeap("after the first TLS handshake");
+  }
+
+  String photoHead;
+  String tail = "--" BOUNDARY "--\r\n";
+  if (photo) {
+    photoHead = "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"plant.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    tail = "\r\n" + tail;
+  }
+  size_t contentLength = fields.length() + photoHead.length() + photoLen + tail.length();
+  String head = String("POST /bot") + tgToken + "/" + method + " HTTP/1.1\r\nHost: " TELEGRAM_HOST "\r\nUser-Agent: PlantCam/" FIRMWARE_VERSION
+                "\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=" BOUNDARY "\r\nContent-Length: " + String((unsigned)contentLength) + "\r\n\r\n";
+  if (!writeAll(*tls, head) || !writeAll(*tls, fields) || !writeAll(*tls, photoHead) || (photo && !writeAll(*tls, photo, photoLen)) || !writeAll(*tls, tail)) {
+    tls->stop();
+    error = "the upload was cut off";
+    return -2;
+  }
+
+  uint32_t deadline = millis() + HTTP_TIMEOUT_MS;
+  String line;
+  if (!readLine(*tls, line, deadline) || !line.startsWith("HTTP/1.")) {
+    tls->stop();
+    error = "no reply";
     return -3;
   }
-
-  uint32_t deadline = millis() + timeoutMs;
-  String line;
-  if (!readLine(c, line, deadline) || !line.startsWith("HTTP/1.")) {
-    c.stop();
-    reply = "no reply";
-    return -4;
-  }
   int code = line.substring(9, 12).toInt();
-  long length = -1;
+  long bodyLength = -1;
   bool chunked = false;
-  while (readLine(c, line, deadline) && line.length()) {
+  while (readLine(*tls, line, deadline) && line.length()) {
     line.toLowerCase();
-    if (line.startsWith("content-length:")) length = line.substring(15).toInt();
+    if (line.startsWith("content-length:")) bodyLength = line.substring(15).toInt();
     else if (line.startsWith("transfer-encoding:") && line.indexOf("chunked") >= 0) chunked = true;
   }
+  String body;
   if (chunked) {
-    while (readLine(c, line, deadline)) {
+    while (readLine(*tls, line, deadline)) {
       long size = strtol(line.c_str(), nullptr, 16);
       if (size <= 0) break;
-      readBody(c, reply, size, deadline);
-      readLine(c, line, deadline);  // the CR LF after each chunk
+      readBody(*tls, body, size, deadline);
+      readLine(*tls, line, deadline);  // the CR LF after each chunk
     }
   } else {
-    readBody(c, reply, length, deadline);
+    readBody(*tls, body, bodyLength, deadline);
   }
-  c.stop();
-  reply.trim();
-  return code;
-}
-
-/** POST the photo in `jpeg` for `slot`. Returns the HTTP status (negative: no connection). */
-static int uploadPhoto(const String &slot) {
-  String reply;
-  int code = httpRequest("POST", "/api/device/captures", "Content-Type: image/jpeg\r\nX-Slot: " + slot + "\r\n", jpeg, jpegLen, UPLOAD_TIMEOUT_MS, reply);
-  Serial.printf("[upload] %s, %u bytes: %d %s\n", slot.c_str(), (unsigned)jpegLen, code, reply.c_str());
-  return code;
-}
-
-/** "capture=<slot>": take the photo with the frame size and LED set over BLE, and upload it. */
-static void captureAndUpload(const String &slot) {
-  if (!takePhoto(FRAMES[frameIndex].size, false, true)) return;  // the server asks again at the next poll
-  for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
-    int code = uploadPhoto(slot);
-    if (code >= 200 && code < 300) return;
-    if (code >= 400 && code < 500) return;  // not asked for, or a bad request: trying again will not help
-    if (attempt < UPLOAD_ATTEMPTS) delay(UPLOAD_RETRY_MS);
-  }
-}
-
-/** GET /api/device/config: report in, and do what the server says (one key=value per line). */
-static void pollServer() {
-  String path = "/api/device/config?fw=" FIRMWARE_VERSION "&ip=" + WiFi.localIP().toString() + "&rssi=" + String(WiFi.RSSI()) + "&heap=" + String(ESP.getFreeHeap());
-  bool firstTls = !tlsChecked && serverUrl.startsWith("https://");
-  if (firstTls) logHeap("before the first TLS handshake");
-  String body;
-  int code = httpRequest("GET", path, String(), nullptr, 0, POLL_TIMEOUT_MS, body);
-  if (firstTls) {
-    logHeap(code > 0 ? "after the first TLS handshake" : "after a FAILED TLS handshake");
-    tlsChecked = code > 0;
-  }
+  tls->stop();
   if (code != 200) {
-    Serial.printf("[poll] %s: %d %s\n", serverUrl.c_str(), code, body.c_str());
+    error = jsonDescription(body);
+    if (error.isEmpty()) error = "HTTP " + String(code);
+  }
+  return code;
+}
+
+// ---- Reports ----
+
+/** The photo's caption: camera, local time, and `note` ("Test report", "Sent 20 min late"). */
+static String reportCaption(const String &note) {
+  String c = "\xF0\x9F\x8C\xB1 ";  // seedling emoji
+  c += deviceName;
+  c += "\n";
+  c += clockValid() ? formatLocal(localMinutes()) + " (" + formatOffset(schedOffset) + ")" : String("Time not known yet");
+  if (note.length()) c += "\n" + note;
+  c += "\nPhoto only for now: the leaf analysis comes with the next firmware.";
+  return c;
+}
+
+/**
+ * Take a photo and send it to the Telegram chat. `quiet` (a scheduled report) shows the progress
+ * in the serial log only. REPORT_REFUSED means trying again would not help (wrong token or chat,
+ * or a broken camera, which the chat is told about).
+ */
+static ReportResult sendReport(bool quiet, const String &note) {
+  if (!telegramReady()) {
+    reportStatus("error:Telegram is not set up", quiet);
+    return REPORT_REFUSED;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    reportStatus("error:the camera is not on WiFi", quiet);
+    return REPORT_FAILED;
+  }
+  String error;
+  if (!takePhoto(quiet)) {
+    if (restartWhenIdle) return REPORT_FAILED;  // out of memory: sent after the restart
+    // Tell the chat, so a broken camera does not go unnoticed.
+    telegramPost("sendMessage", formField("chat_id", tgChat) + formField("text", String(deviceName) + ": the camera could not take the photo. Check the ribbon cable, then restart the camera."), nullptr, 0, error);
+    return REPORT_REFUSED;
+  }
+  if (!quiet) setStatus("sending");
+  stopCamera();  // its internal RAM goes to WiFi and TCP during the upload
+  int code = telegramPost("sendPhoto", formField("chat_id", tgChat) + formField("caption", reportCaption(note)), jpeg, jpegLen, error);
+  Serial.printf("[telegram] sendPhoto, %u bytes: %d %s\n", (unsigned)jpegLen, code, error.c_str());
+  if (startCamera() != ESP_OK) restartWhenIdle = true;
+  logHeap("after the report");
+  if (code == 200) {
+    if (!quiet) setStatus("ready");
+    return REPORT_SENT;
+  }
+  reportStatus(code < 0 ? "error:could not reach Telegram (" + error + ")" : "error:Telegram: " + error, quiet);
+  return code >= 400 && code < 500 && code != 429 ? REPORT_REFUSED : REPORT_FAILED;
+}
+
+/** The latest scheduled time at or before `nowMin` (local minutes since 1970), or 0 if none this week. */
+static uint32_t latestSlot(int64_t nowMin) {
+  int64_t today = nowMin / 1440;
+  for (int k = 0; k <= 7; k++) {
+    int64_t day = today - k;
+    if (!(schedDays & (1 << weekday(day)))) continue;
+    int64_t slot = day * 1440 + schedMinute;
+    if (slot <= nowMin) return (uint32_t)slot;
+  }
+  return 0;
+}
+
+static void markHandled(uint32_t slot) {
+  lastSlot = slot;
+  prefs.putUInt("lastslot", lastSlot);
+}
+
+/** Called from loop(): send the report when a scheduled time is due, once per time. */
+static void serviceSchedule() {
+  if (!schedDays || !clockValid()) return;
+  int64_t now = localMinutes();
+  uint32_t slot = latestSlot(now);
+  if (skipPastSlots) {
+    skipPastSlots = false;
+    if (slot > lastSlot) markHandled(slot);
     return;
   }
-  lastPollOkAt = millis();
+  if (!slot || slot <= lastSlot) return;
+  int32_t late = (int32_t)(now - slot);
+  if (late > LATE_LIMIT_MIN) return;  // missed while the camera was off, and too long ago now
+  if (!telegramReady() || WiFi.status() != WL_CONNECTED || (int32_t)(millis() - nextReportTryAt) < 0) return;
 
-  String slot;
-  int start = 0;
-  while (start < (int)body.length()) {
-    int end = body.indexOf('\n', start);
-    if (end < 0) end = body.length();
-    String line = body.substring(start, end);
-    line.trim();
-    start = end + 1;
-    if (line.startsWith("poll=")) {
-      long seconds = line.substring(5).toInt();
-      if (seconds >= 10 && seconds <= 3600) pollMs = seconds * 1000;
-    } else if (line.startsWith("capture=")) {
-      slot = line.substring(8);
-    }
+  String note;
+  if (late > LATE_AFTER_MIN) {
+    char at[8];
+    snprintf(at, sizeof(at), "%u:%02u", schedMinute / 60, schedMinute % 60);
+    note = "Sent " + String(late) + " min late: the camera was off or offline at " + at + ".";
   }
-  Serial.printf("[poll] ok%s%s\n", slot.length() ? ", capture " : "", slot.c_str());
-  if (slot.length()) captureAndUpload(slot);
+  Serial.printf("[report] scheduled for %s\n", formatLocal(slot).c_str());
+  ReportResult result = sendReport(true, note);
+  if (result == REPORT_FAILED) nextReportTryAt = millis() + REPORT_RETRY_MS;
+  else markHandled(slot);
 }
 
-/** Called from loop(): keep the WiFi up and poll the server every `pollMs`. */
+// ---- WiFi ----
+
+static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastDisconnectReason = info.wifi_sta_disconnected.reason;
+  else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) lastDisconnectReason = 0;
+}
+
+/** Why joining failed, from the last disconnect reason. */
+static const char *wifiFailure(uint16_t reason) {
+  switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "network not found";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_MIC_FAILURE: return "wrong password";
+    default: return "timeout";
+  }
+}
+
+static void beginWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  lastDisconnectReason = 0;
+  lastWifiAttemptAt = millis();
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+}
+
+/** "wifi:connect": join the saved WiFi (two tries), and say why if it fails. */
+static void connectWifi() {
+  if (wifiSsid.isEmpty()) {
+    setStatus("error:no WiFi name saved");
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == wifiSsid && !wifiDirty) {
+    updateInfo();
+    setStatus("ready");
+    return;
+  }
+  for (int attempt = 1; attempt <= WIFI_ATTEMPTS; attempt++) {
+    setStatus("connecting");  // also restarts the web app's timer
+    WiFi.disconnect();
+    delay(200);
+    beginWifi();
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_ATTEMPT_MS) delay(100);
+    if (WiFi.status() == WL_CONNECTED) break;
+    Serial.printf("[wifi] attempt %d: %s (reason %u)\n", attempt, wifiFailure(lastDisconnectReason), lastDisconnectReason);
+    if (strcmp(wifiFailure(lastDisconnectReason), "wrong password") == 0) break;  // another try will not help
+  }
+  wifiDirty = false;
+  updateInfo();
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiWasUp = false;
+    wifiDownSince = millis();  // the 30-minute restart counts from now
+    setStatus(String("error:") + wifiFailure(lastDisconnectReason));
+    return;
+  }
+  Serial.printf("[wifi] joined %s, IP %s, %d dBm\n", wifiSsid.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  wifiWasUp = true;
+  startClock();
+  updateInfo();
+  setStatus("ready");
+}
+
+static void forgetWifi() {
+  wifiSsid = "";
+  wifiPass = "";
+  prefs.remove("ssid");
+  prefs.remove("pass");
+  WiFi.disconnect(true);
+  wifiWasUp = false;
+  updateInfo();
+  setStatus("ready");
+}
+
+/** Called from loop(): keep the WiFi up, start the clock, restart after a long outage. */
 static void serviceWifi() {
   if (wifiSsid.isEmpty()) return;
   uint32_t now = millis();
-  bool configured = serverUrl.length() && deviceKey.length();
-  if (configured && !connected && now - lastPollOkAt > RESTART_AFTER_MS) {
-    Serial.println("[wifi] no successful poll for 30 minutes, restarting");
-    delay(100);
-    ESP.restart();
-  }
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiWasUp) {
       wifiWasUp = false;
+      wifiDownSince = now;
       Serial.println("[wifi] connection lost, reconnecting");
       updateInfo();
+    }
+    if (!connected && now - wifiDownSince > RESTART_AFTER_MS) {
+      Serial.println("[wifi] offline for 30 minutes, restarting");
+      delay(100);
+      ESP.restart();
     }
     if (now - lastWifiAttemptAt > WIFI_RETRY_MS) beginWifi();
     return;
   }
   if (!wifiWasUp) {
     wifiWasUp = true;
-    pollNow = true;  // check in right away, so the Settings page sees the camera within seconds
     Serial.printf("[wifi] connected to %s, IP %s, %d dBm\n", wifiSsid.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    logHeap("WiFi up");
+    startClock();
     updateInfo();
   }
-  if (!configured) return;
-  if (pollNow || (int32_t)(now - nextPollAt) >= 0) {
-    pollNow = false;
-    pollServer();
-    nextPollAt = millis() + pollMs;
-  }
 }
+
+/** Called from loop(): note when the time first arrives from the internet. */
+static void serviceClock() {
+  if (clockWasValid || !clockValid()) return;
+  clockWasValid = true;
+  Serial.printf("[clock] %s (%s)\n", formatLocal(localMinutes()).c_str(), formatOffset(schedOffset).c_str());
+  updateInfo();
+}
+
+// ---- BLE ----
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *, esp_ble_gatts_cb_param_t *) override {
+    connected = true;
+    Serial.println("[ble] connected");
+  }
+  void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *) override {
+    connected = false;
+    Serial.println("[ble] disconnected");
+  }
+};
+
+class ControlCallbacks : public BLECharacteristicCallbacks {
+  // Runs on the Bluetooth task: only queue the command, loop() does the slow work.
+  void onWrite(BLECharacteristic *c) override {
+    Command cmd = {};
+    String value = c->getValue();
+    strncpy(cmd.text, value.c_str(), sizeof(cmd.text) - 1);
+    if (xQueueSend(commands, &cmd, 0) != pdTRUE) Serial.println("[ble] command queue full");
+  }
+};
 
 /** Save one setting from a "name:value" command. */
 static void saveSetting(const char *key, String &target, const char *value) {
@@ -727,35 +799,11 @@ static void saveSetting(const char *key, String &target, const char *value) {
 }
 
 static void handleCommand(const char *text) {
-  if (strcmp(text, "preview") == 0) {
-    if (takePhoto(PREVIEW_SIZE, true)) sendPhoto(true);
-    return;
-  }
-  // The WiFi password and the device key stay out of the serial log.
-  if (strncmp(text, "wifi-pass:", 10) == 0 || strncmp(text, "key:", 4) == 0) Serial.printf("[cmd] %.*s***\n", (int)(strchr(text, ':') - text + 1), text);
+  // The WiFi password and the bot token stay out of the serial log.
+  if (strncmp(text, "wifi-pass:", 10) == 0 || strncmp(text, "tg-token:", 9) == 0) Serial.printf("[cmd] %.*s***\n", (int)(strchr(text, ':') - text + 1), text);
   else Serial.printf("[cmd] %s\n", text);
-  if (strcmp(text, "capture") == 0) {
-    if (takePhoto(FRAMES[frameIndex].size, false)) sendPhoto(false);
-  } else if (strncmp(text, "resend:", 7) == 0) {
-    resendChunks(text + 7);
-  } else if (strncmp(text, "frame:", 6) == 0) {
-    for (int i = 0; i < FRAME_COUNT; i++) {
-      if (strcmp(text + 6, FRAMES[i].name) != 0) continue;
-      if (!psramFound() && FRAMES[i].size > FRAMESIZE_VGA) break;
-      frameIndex = i;  // the sensor switches at the next capture
-      prefs.putUChar("frame", i);
-      updateInfo();
-      setStatus("ready");
-      return;
-    }
-    setStatus("error:unsupported frame size");
-  } else if (strncmp(text, "led:", 4) == 0) {
-    ledLevel = constrain(atoi(text + 4), 0, 255);
-    if (ledOn) setLed(true);  // the new brightness now (or off for 0)
-    prefs.putUChar("led", ledLevel);
-    updateInfo();
-    setStatus("ready");
-  } else if (strcmp(text, "info") == 0) {
+
+  if (strcmp(text, "info") == 0) {
     updateInfo();
     setStatus(cameraOk ? "ready" : "error:camera not found, check the ribbon cable");
   } else if (strncmp(text, "wifi-ssid:", 10) == 0) {
@@ -767,26 +815,31 @@ static void handleCommand(const char *text) {
     prefs.putString("pass", wifiPass);
     wifiDirty = true;
     setStatus("ready");
-  } else if (strncmp(text, "server:", 7) == 0) {
-    String url = String(text + 7);
-    url.trim();
-    while (url.endsWith("/")) url.remove(url.length() - 1);
-    ServerAddress address;
-    if (!parseServer(url, address)) {
-      setStatus("error:the server address must look like https://example.com");
-      return;
-    }
-    saveSetting("server", serverUrl, url.c_str());
-    updateInfo();
-    setStatus("ready");
-  } else if (strncmp(text, "key:", 4) == 0) {
-    saveSetting("key", deviceKey, text + 4);
-    updateInfo();
-    setStatus("ready");
   } else if (strcmp(text, "wifi:connect") == 0) {
     connectWifi();
   } else if (strcmp(text, "wifi:forget") == 0) {
     forgetWifi();
+  } else if (strncmp(text, "tg-token:", 9) == 0) {
+    if (!validToken(text + 9)) return setStatus("error:that is not a Telegram bot token");
+    saveSetting("tgtoken", tgToken, text + 9);
+    updateInfo();
+    setStatus("ready");
+  } else if (strncmp(text, "tg-chat:", 8) == 0) {
+    if (!validChatId(text + 8)) return setStatus("error:that is not a Telegram chat id");
+    saveSetting("tgchat", tgChat, text + 8);
+    updateInfo();
+    setStatus("ready");
+  } else if (strncmp(text, "tg-label:", 9) == 0) {
+    saveSetting("tglabel", tgLabel, text + 9);
+    if (tgLabel.length() > MAX_LABEL_BYTES) tgLabel.remove(MAX_LABEL_BYTES);
+    updateInfo();
+    setStatus("ready");
+  } else if (strncmp(text, "schedule:", 9) == 0) {
+    if (!saveSchedule(text + 9)) return setStatus("error:the schedule must look like 62,07:00,480");
+    updateInfo();
+    setStatus("ready");
+  } else if (strcmp(text, "report") == 0) {
+    sendReport(false, "Test report");
   } else {
     setStatus("error:unknown command");
   }
@@ -795,41 +848,44 @@ static void handleCommand(const char *text) {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[plantcam] firmware " FIRMWARE_VERSION);
+  // Before any TLS: its buffers (about 40 KB) go to PSRAM instead of the internal RAM.
+  if (psramFound()) mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, LOW);  // the flash LED stays off
   commands = xQueueCreate(8, sizeof(Command));
 
   prefs.begin("plantcam", false);
-  frameIndex = constrain(prefs.getUChar("frame", 1), 0, FRAME_COUNT - 1);
-  ledLevel = prefs.getUChar("led", 0);
+  for (const char *old : {"server", "key", "frame", "led"}) prefs.remove(old);  // firmware 2 settings
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
-  serverUrl = prefs.getString("server", "");
-  deviceKey = prefs.getString("key", "");
+  tgToken = prefs.getString("tgtoken", "");
+  tgChat = prefs.getString("tgchat", "");
+  tgLabel = prefs.getString("tglabel", "");
+  schedDays = prefs.getUChar("sdays", 0);
+  schedMinute = prefs.getUShort("stime", 7 * 60);
+  schedOffset = prefs.getShort("soff", 0);
+  lastSlot = prefs.getUInt("lastslot", 0);
 
-  cameraOk = initCamera();
+  logHeap("start");
+  cameraOk = startCamera() == ESP_OK;
   Serial.printf("[camera] %s, PSRAM %s\n", cameraOk ? "ok" : "FAILED", psramFound() ? "yes" : "no");
-  // After the camera, like the core's CameraWebServer example: the camera's XCLK owns LEDC timer 0.
-  ledcAttach(LED_GPIO_NUM, 5000, 8);
-  ledcWrite(LED_GPIO_NUM, 0);
+  logHeap("camera on");
 
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_BT);
-  char name[20];
-  snprintf(name, sizeof(name), "PlantCam-%02X%02X", mac[4], mac[5]);
+  snprintf(deviceName, sizeof(deviceName), "PlantCam-%02X%02X", mac[4], mac[5]);
 
-  BLEDevice::init(name);
-  BLEDevice::setMTU(ESP_GATT_MAX_MTU_SIZE);
+  BLEDevice::init(deviceName);
+  BLEDevice::setMTU(ESP_GATT_MAX_MTU_SIZE);  // the Info JSON is read in one go
   server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
   server->advertiseOnDisconnect(true);
 
-  BLEService *service = server->createService(BLEUUID(SERVICE_UUID), 16);
+  BLEService *service = server->createService(BLEUUID(SERVICE_UUID), 12);
   BLECharacteristic *control = service->createCharacteristic(CONTROL_UUID, BLECharacteristic::PROPERTY_WRITE);
   control->setCallbacks(new ControlCallbacks());
   statusChar = service->createCharacteristic(STATUS_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   statusChar->addDescriptor(new BLE2902());
-  dataChar = service->createCharacteristic(DATA_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  dataChar->addDescriptor(new BLE2902());
-  dataChar->setCallbacks(new DataCallbacks());
   infoChar = service->createCharacteristic(INFO_UUID, BLECharacteristic::PROPERTY_READ);
   updateInfo();
   statusChar->setValue(cameraOk ? "ready" : "error:camera not found, check the ribbon cable");
@@ -839,25 +895,45 @@ void setup() {
   advertising->addServiceUUID(SERVICE_UUID);
   advertising->setScanResponse(true);  // the name goes in the scan response when it does not fit
   BLEDevice::startAdvertising();
-  Serial.printf("[ble] advertising as %s\n", name);
+  Serial.printf("[ble] advertising as %s\n", deviceName);
 
-  // WiFi after BLE, so the heap numbers logged before the first TLS handshake include both.
   WiFi.onEvent(onWifiEvent);
   logHeap("BLE running");
+  Serial.printf("[telegram] %s, schedule %s\n", telegramReady() ? tgLabel.c_str() : "not set up", schedDays ? scheduleText().c_str() : "not set");
   if (wifiSsid.length()) {
-    Serial.printf("[wifi] joining %s, server %s\n", wifiSsid.c_str(), serverUrl.length() ? serverUrl.c_str() : "(not set)");
+    Serial.printf("[wifi] joining %s\n", wifiSsid.c_str());
+    wifiDownSince = millis();
     beginWifi();
   } else {
-    Serial.println("[wifi] not set up: use the Settings page (Daily email report, step 1)");
+    Serial.println("[wifi] not set up: use the setup page");
+  }
+}
+
+/** The same commands typed in the serial monitor (one per line), plus "heap". */
+static void serviceSerial() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') {
+      if (line.length() < sizeof(Command::text) - 1) line += c;
+      continue;
+    }
+    if (line == "heap") logHeap("now");
+    else if (line.length()) handleCommand(line.c_str());
+    line = "";
   }
 }
 
 void loop() {
   Command cmd;
-  if (xQueueReceive(commands, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (connected) updateInfo();  // keeps the reported MTU current
-    handleCommand(cmd.text);
-  }
-  if (ledOn && (int32_t)(millis() - ledOffAt) > 0) setLed(false);
+  if (xQueueReceive(commands, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) handleCommand(cmd.text);
+  serviceSerial();
   serviceWifi();
+  serviceClock();
+  serviceSchedule();
+  if (restartWhenIdle && !connected) {
+    Serial.println("[plantcam] out of memory, restarting");
+    delay(100);
+    ESP.restart();
+  }
 }

@@ -7,11 +7,13 @@ import {
   firmwareMajor,
   INFO_UUID,
   MAX_COMMAND_LENGTH,
+  MAX_LABEL_BYTES,
   parseInfo,
   parseSchedule,
   parseStatus,
   SERVICE_UUID,
   STATUS_UUID,
+  TELEGRAM_FIRMWARE,
   truncateBytes,
 } from "@/lib/ble/protocol";
 
@@ -132,5 +134,15 @@ describe("firmware", () => {
     }
   });
 
-  it.todo("knows the Telegram, schedule and report commands (firmware 3)");
+  it("knows the Telegram, schedule and report commands, and reports what the web app reads", () => {
+    expect(firmwareMajor(define("FIRMWARE_VERSION") ?? "")).toBeGreaterThanOrEqual(TELEGRAM_FIRMWARE);
+    const prefix = (c: string) => c.slice(0, c.indexOf(":") + 1);
+    for (const c of [prefix(command.telegramToken("x")), prefix(command.telegramChat(1)), prefix(command.telegramLabel("x")), prefix(command.schedule({ days: [1], time: "07:00", utcOffset: 0 })), command.report]) {
+      expect(firmware).toContain(`"${c}"`);
+    }
+    for (const key of ["telegram", "tgLabel", "schedule", "clock", "wifi", "ssid", "ip"]) {
+      expect(firmware).toContain(`\\"${key}\\":`);
+    }
+    expect(Number(firmware.match(/MAX_LABEL_BYTES = (\d+)/)?.[1])).toBe(MAX_LABEL_BYTES);
+  });
 });

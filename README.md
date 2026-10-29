@@ -11,9 +11,10 @@ web app --Bluetooth--> PlantCam: WiFi, Telegram bot token + chat, schedule (save
 PlantCam --WiFi/HTTPS--> api.telegram.org: photo + leaf cover + status, at the set time
 ```
 
-> **Status:** the setup page is done. Firmware 3 (Telegram settings, the clock from the internet,
-> analysis on the camera and the upload to Telegram) is next; firmware 2.0 on the board today only
-> takes the WiFi step, and the page says so.
+> **Status:** the setup page and firmware 3.0 work end to end: the camera keeps the settings, gets
+> the time from the internet and sends the **photo** to Telegram at the set time (or on **Send a
+> test report now**). The analysis on the camera (leaf cover, status) is next; until then the
+> caption says so.
 
 ## Run it
 
@@ -85,11 +86,26 @@ The sketch is `firmware/esp32-cam/esp32-cam.ino` (ESP32 Arduino core 3.x, no ext
   ```
 
 The serial monitor (115200 baud) shows `[camera] ok, PSRAM yes`, `[ble] advertising as
-PlantCam-XXXX` and the WiFi state. The camera needs a steady 5 V 2 A supply: WiFi bursts reset it
-on weak ones.
+PlantCam-XXXX`, the WiFi, `[clock] …` once the time arrives, and each report. The Bluetooth
+commands can also be typed there, one per line (`report`, `info`, …), plus `heap` for the free
+memory. The camera needs a steady 5 V 2 A supply: WiFi bursts reset it on weak ones.
 
-BLE, WiFi and the PSRAM fix together nearly fill the ESP32's instruction RAM (IRAM): v2.0 uses
-about 125 of 128 KB. Keep an eye on IRAM when adding libraries.
+A scheduled report is sent once per set time. One missed while the camera was off or offline is
+still sent up to 3 hours late (the caption says so); one that cannot reach Telegram is retried
+every 5 minutes in that window. The first scheduled time after saving a schedule is the next one,
+not one already past today.
+
+**Memory.** The ESP32 has about 190 KB of internal RAM at start; the camera driver takes 43 KB,
+BLE 87 KB and WiFi 48 KB, which leaves about 13 KB, too little for an HTTPS upload. So the TLS
+buffers are allocated in PSRAM (`mbedtls_platform_set_calloc_free`), and the camera driver is
+stopped during each upload (about 50 KB free then) and started again after. If it cannot start
+again, the camera restarts and sends a missed scheduled report late. BLE, WiFi and the PSRAM fix
+also nearly fill the instruction RAM (IRAM): about 127 of 128 KB, so the firmware avoids libc's
+time functions (the PSRAM fix puts them in IRAM) and computes dates itself.
+
+**Windows and an older firmware.** If Windows paired with the camera under an older firmware, it
+keeps that firmware's Bluetooth layout and connections fail ("Invalid handle"). Remove
+PlantCam-XXXX under Settings → Bluetooth & devices, then connect again.
 
 ### Bluetooth protocol
 
