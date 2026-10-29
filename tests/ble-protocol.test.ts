@@ -4,20 +4,58 @@ import { describe, expect, it } from "vitest";
 import {
   command,
   CONTROL_UUID,
+  crc32,
+  DATA_UUID,
   firmwareAtLeast,
   firmwareMajor,
+  FrameAssembler,
   INFO_UUID,
   INTERVAL_FIRMWARE,
   MAX_COMMAND_LENGTH,
   MAX_LABEL_BYTES,
   parseInfo,
+  parsePacket,
   parseSchedule,
   parseStatus,
   SERVICE_UUID,
   STATUS_UUID,
   TELEGRAM_FIRMWARE,
   truncateBytes,
+  type StartPacket,
 } from "@/lib/ble/protocol";
+import { framePackets } from "./ble-packets";
+
+describe("preview packets", () => {
+  const jpeg = Uint8Array.from({ length: 1000 }, (_, i) => (i * 7) % 256);
+
+  it("computes the zlib CRC-32", () => {
+    expect(crc32(new TextEncoder().encode("123456789"))).toBe(0xcbf43926);
+  });
+
+  it("rebuilds a frame from its packets, in any order", () => {
+    const [start, ...rest] = framePackets(jpeg).map(parsePacket);
+    expect(start).toMatchObject({ type: "start", size: 1000, chunkCount: 5, width: 640, height: 480, frameId: 1 });
+    const assembler = new FrameAssembler(start as StartPacket);
+    for (const p of rest.slice(0, -1).reverse()) if (p?.type === "chunk") assembler.add(p);
+    expect(rest.at(-1)).toEqual({ type: "end", chunkCount: 5, frameId: 1 });
+    expect(assembler.complete).toBe(true);
+    expect(assembler.assemble()).toEqual(jpeg);
+  });
+
+  it("refuses a damaged or incomplete frame", () => {
+    const damaged = framePackets(jpeg, { crc: 1 }).map(parsePacket);
+    const a = new FrameAssembler(damaged[0] as StartPacket);
+    for (const p of damaged) if (p?.type === "chunk") a.add(p);
+    expect(a.assemble()).toBeNull();
+
+    const packets = framePackets(jpeg).map(parsePacket);
+    const b = new FrameAssembler(packets[0] as StartPacket);
+    b.add(packets[1] as Parameters<FrameAssembler["add"]>[0]);
+    expect(b.complete).toBe(false);
+    expect(b.assemble()).toBeNull();
+    expect(parsePacket(new DataView(new ArrayBuffer(0)))).toBeNull();
+  });
+});
 
 describe("status", () => {
   it("parses the status text", () => {
@@ -140,6 +178,7 @@ describe("firmware", () => {
     expect(define("CONTROL_UUID")).toBe(CONTROL_UUID);
     expect(define("STATUS_UUID")).toBe(STATUS_UUID);
     expect(define("INFO_UUID")).toBe(INFO_UUID);
+    expect(define("DATA_UUID")).toBe(DATA_UUID);
   });
 
   it("accepts commands as long as the web client sends, and knows every WiFi command", () => {
@@ -152,7 +191,7 @@ describe("firmware", () => {
   it("knows the Telegram, schedule and report commands, and reports what the web app reads", () => {
     expect(firmwareMajor(define("FIRMWARE_VERSION") ?? "")).toBeGreaterThanOrEqual(TELEGRAM_FIRMWARE);
     const prefix = (c: string) => c.slice(0, c.indexOf(":") + 1);
-    for (const c of [prefix(command.telegramToken("x")), prefix(command.telegramChat(1)), prefix(command.telegramLabel("x")), prefix(command.schedule({ days: [1], time: "07:00", utcOffset: 0 })), command.report]) {
+    for (const c of [prefix(command.telegramToken("x")), prefix(command.telegramChat(1)), prefix(command.telegramLabel("x")), prefix(command.schedule({ days: [1], time: "07:00", utcOffset: 0 })), command.report, command.preview]) {
       expect(firmware).toContain(`"${c}"`);
     }
     expect(firmwareAtLeast(define("FIRMWARE_VERSION") ?? "", INTERVAL_FIRMWARE)).toBe(true);

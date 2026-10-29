@@ -56,7 +56,10 @@ Safari and Firefox do not have Web Bluetooth (on iPhone, the Bluefy browser does
 
 ## Set up the camera
 
-Open the page near the powered camera, **Connect camera** and pick `PlantCam-XXXX`. Then, in order:
+Open the page near the powered camera, **Connect camera** and pick `PlantCam-XXXX`.
+**Show the camera view** shows what the camera sees, live (a few frames a second over Bluetooth),
+with the square it measures outlined: aim the camera so the plant is inside it, then **Stop**.
+Then, in order:
 
 1. **WiFi**: name and password of a 2.4 GHz network with internet (the camera cannot join 5 GHz).
 2. **Telegram**: create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and paste its
@@ -166,13 +169,18 @@ One GATT service, `7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10` (UUIDs and parsing in
 
 | Characteristic | Type | Content |
 |---|---|---|
-| Control `…0001` | write | One command at a time, up to 199 bytes: `info`; `wifi-ssid:<name>`, `wifi-pass:<password>`, `wifi:connect`, `wifi:forget`; `tg-token:<bot token>`, `tg-chat:<chat id>`, `tg-label:<who gets the reports>`; `schedule:<days>,<HH:MM>,<UTC offset, min>` (days: bit 0 = Sunday … bit 6 = Saturday) or `schedule:every:<minutes>,<UTC offset, min>`; `report` |
+| Control `…0001` | write | One command at a time, up to 199 bytes: `info`; `wifi-ssid:<name>`, `wifi-pass:<password>`, `wifi:connect`, `wifi:forget`; `tg-token:<bot token>`, `tg-chat:<chat id>`, `tg-label:<who gets the reports>`; `schedule:<days>,<HH:MM>,<UTC offset, min>` (days: bit 0 = Sunday … bit 6 = Saturday) or `schedule:every:<minutes>,<UTC offset, min>`; `report`; `preview` |
 | Status `…0002` | read, notify | `ready` / `connecting` / `capturing` / `analyzing` / `sending` / `error:<message>` (`wifi:connect` fails with `wrong password`, `network not found` or `timeout`) |
+| Data `…0003` | notify | `preview`'s frame, a 640 × 480 JPEG of about 10 KB: START (u32 size, u16 chunks, u32 CRC-32, u16 chunk size, u16 width, u16 height, u16 frame id), CHUNK × n (u16 seq, payload), END (u16 chunks, u16 frame id), little-endian |
 | Info `…0004` | read | JSON: `fw`, `model`, `camera`, `wifi`, `ssid`, `ip`, `rssi`, `telegram`, `tgLabel`, `schedule` (as sent), `clock` (has the time) |
 
 Each command answers `ready` or `error:…`; `wifi:connect` and `report` pass through the other
-states first (`report`: `capturing` and `analyzing` for each photo). The `tg-*`, `schedule` and
-`report` commands come with firmware 3, `schedule:every:` with 3.3.
+states first (`report`: `capturing` and `analyzing` for each photo); `preview` answers on Data,
+with a status only if it fails, and scheduled reports wait while the preview runs. A frame takes
+about 0.3 s with the camera on WiFi. The preview is the whole 4:3 sensor; the report photo is 5:4,
+for which the OV2640 driver skips 50 of 1600 px on each side, so the page draws the measured
+square there. The `tg-*`, `schedule` and `report` commands come with firmware 3,
+`schedule:every:` with 3.3, `preview` and Data with 3.5.
 
 ## Tests
 

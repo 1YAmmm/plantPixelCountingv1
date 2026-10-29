@@ -1,10 +1,13 @@
 import {
   command,
   CONTROL_UUID,
+  DATA_UUID,
   DEVICE_NAME_PREFIX,
+  FrameAssembler,
   INFO_UUID,
   MAX_COMMAND_LENGTH,
   parseInfo,
+  parsePacket,
   parseStatus,
   SERVICE_UUID,
   STATUS_UUID,
@@ -14,8 +17,9 @@ import {
 } from "./protocol";
 
 // Web Bluetooth client for setting up the PlantCam (lib/ble/protocol.ts): WiFi, the Telegram chat
-// for its reports and when to send them. The connection lives at module level so it survives the
-// setup steps re-rendering, without opening the device chooser again.
+// for its reports and when to send them, and a live preview of its view for aiming it. The
+// connection lives at module level so it survives the setup steps re-rendering, without opening
+// the device chooser again.
 
 export type Connection = "disconnected" | "connecting" | "connected";
 
@@ -27,8 +31,18 @@ export interface Esp32State {
   deviceName: string | null;
   status: DeviceStatus | null;
   info: DeviceInfo | null;
-  /** A command is running. */
+  /** A command is running (or the preview). */
   busy: boolean;
+  /** The firmware can send a preview (3.5+). */
+  canPreview: boolean;
+  previewing: boolean;
+}
+
+/** One frame of the live preview. */
+export interface PreviewFrame {
+  jpeg: Blob;
+  width: number;
+  height: number;
 }
 
 interface Waiter {
@@ -38,10 +52,18 @@ interface Waiter {
   reject: (error: Error) => void;
 }
 
+interface FrameWaiter {
+  timer: ReturnType<typeof setTimeout>;
+  resolve: (frame: PreviewFrame | null) => void;
+  reject: (error: Error) => void;
+}
+
 interface Characteristics {
   control: BluetoothRemoteGATTCharacteristic;
   status: BluetoothRemoteGATTCharacteristic;
   info: BluetoothRemoteGATTCharacteristic;
+  /** Missing before firmware 3.5. */
+  data: BluetoothRemoteGATTCharacteristic | null;
 }
 
 const COMMAND_TIMEOUT_MS = 6_000;
@@ -49,6 +71,10 @@ const COMMAND_TIMEOUT_MS = 6_000;
 const WIFI_CONNECT_TIMEOUT_MS = 20_000;
 /** The longest wait between a report's steps (photos, analyses, the upload to Telegram over a slow link). */
 const REPORT_TIMEOUT_MS = 90_000;
+/** The longest wait between two packets of a preview frame. */
+const FRAME_TIMEOUT_MS = 5_000;
+/** Damaged or lost preview frames in a row before the preview gives up. */
+const MAX_LOST_FRAMES = 3;
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -68,6 +94,8 @@ const SERVER_STATE: Esp32State = {
   status: null,
   info: null,
   busy: false,
+  canPreview: false,
+  previewing: false,
 };
 
 export class Esp32Camera {
@@ -77,6 +105,9 @@ export class Esp32Camera {
   private chars: Characteristics | null = null;
   private gattQueue: Promise<unknown> = Promise.resolve();
   private waiter: Waiter | null = null;
+  private frameWaiter: FrameWaiter | null = null;
+  private assembler: FrameAssembler | null = null;
+  private previewOn = false;
 
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -151,25 +182,33 @@ export class Esp32Camera {
       control: await service.getCharacteristic(CONTROL_UUID),
       status: await service.getCharacteristic(STATUS_UUID),
       info: await service.getCharacteristic(INFO_UUID),
+      data: await service.getCharacteristic(DATA_UUID).catch(() => null),
     };
     this.detach();
     chars.status.addEventListener("characteristicvaluechanged", this.onStatus);
     await chars.status.startNotifications();
+    if (chars.data) {
+      chars.data.addEventListener("characteristicvaluechanged", this.onData);
+      await chars.data.startNotifications();
+    }
     this.chars = chars;
     const status = parseStatus(decoder.decode(await chars.status.readValue()));
     const info = parseInfo(decoder.decode(await chars.info.readValue()));
-    this.set({ status, info });
+    this.set({ status, info, canPreview: !!chars.data });
   }
 
   private detach() {
     this.chars?.status.removeEventListener("characteristicvaluechanged", this.onStatus);
+    this.chars?.data?.removeEventListener("characteristicvaluechanged", this.onData);
     this.chars = null;
   }
 
   private onDisconnected = () => {
     this.detach();
+    this.previewOn = false;
     this.settle(new Error("The camera disconnected"));
-    this.set({ connection: "disconnected", busy: false });
+    this.settleFrame(new Error("The camera disconnected"));
+    this.set({ connection: "disconnected", busy: false, previewing: false });
   };
 
   /** Read the Info again (the camera may have joined the WiFi or got the time since). */
@@ -200,6 +239,78 @@ export class Esp32Camera {
   async sendReport(): Promise<void> {
     await this.run([], { text: command.report, timeoutMs: REPORT_TIMEOUT_MS });
   }
+
+  /**
+   * Show the camera's view: frames one after the other, each passed to `onFrame`, until
+   * stopPreview() or an error. The camera does nothing else meanwhile (the state is busy).
+   */
+  startPreview(onFrame: (frame: PreviewFrame) => void): Promise<void> {
+    if (!this.chars?.data) return Promise.reject(new Error("This firmware has no preview. Flash the latest firmware."));
+    return this.exclusive(async () => {
+      this.previewOn = true;
+      this.set({ previewing: true });
+      try {
+        let lost = 0;
+        while (this.previewOn) {
+          const frame = await this.previewFrame();
+          if (frame) {
+            lost = 0;
+            onFrame(frame);
+          } else if (++lost >= MAX_LOST_FRAMES) {
+            throw new Error("The preview keeps arriving damaged. Move closer to the camera.");
+          }
+        }
+      } finally {
+        this.previewOn = false;
+        this.set({ previewing: false });
+      }
+    });
+  }
+
+  /** Stop the preview after the frame on its way. */
+  stopPreview(): void {
+    this.previewOn = false;
+  }
+
+  /** Ask for one preview frame; resolves with null when it arrived damaged. */
+  private previewFrame(): Promise<PreviewFrame | null> {
+    const done = new Promise<PreviewFrame | null>((resolve, reject) => {
+      this.assembler = null;
+      this.frameWaiter = { resolve, reject, timer: setTimeout(() => this.settleFrame(this.timeoutError()), FRAME_TIMEOUT_MS) };
+    });
+    const control = this.chars?.control;
+    if (!control) this.settleFrame(new Error("The camera is not connected"));
+    else this.gatt(() => control.writeValueWithResponse(encoder.encode(command.preview))).catch((e) => this.settleFrame(asError(e)));
+    return done;
+  }
+
+  private settleFrame(result: Error | PreviewFrame | null) {
+    const waiter = this.frameWaiter;
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    this.frameWaiter = null;
+    this.assembler = null;
+    if (result instanceof Error) waiter.reject(result);
+    else waiter.resolve(result);
+  }
+
+  private onData = (e: Event) => {
+    const value = (e.target as BluetoothRemoteGATTCharacteristic).value;
+    const waiter = this.frameWaiter;
+    const packet = value && parsePacket(value);
+    if (!waiter || !packet) return;
+    clearTimeout(waiter.timer);
+    waiter.timer = setTimeout(() => this.settleFrame(this.timeoutError()), FRAME_TIMEOUT_MS);
+    if (packet.type === "start") {
+      this.assembler = new FrameAssembler(packet);
+    } else if (packet.type === "chunk") {
+      this.assembler?.add(packet);
+    } else {
+      const { assembler } = this;
+      const jpeg = assembler?.start.frameId === packet.frameId ? assembler.assemble() : null;
+      this.settleFrame(jpeg && assembler ? { jpeg: new Blob([jpeg], { type: "image/jpeg" }), width: assembler.start.width, height: assembler.start.height } : null);
+    }
+  };
 
   /** Send `commands` one by one, each answered with "ready", then `last` with its own timeout; then reread the Info. */
   private run(commands: string[], last?: { text: string; timeoutMs: number }): Promise<DeviceInfo | null> {
@@ -262,6 +373,8 @@ export class Esp32Camera {
     if (!value) return;
     const status = parseStatus(decoder.decode(value));
     this.set({ status });
+    // A preview frame answers with a status only when it fails.
+    if (this.frameWaiter && status.state === "error") this.settleFrame(new Error(`Camera: ${status.message}`));
     const waiter = this.waiter;
     if (!waiter) return;
     if (status.state === "error") this.settle(new Error(`Camera: ${status.message}`));

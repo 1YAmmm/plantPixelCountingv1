@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Esp32Camera } from "@/lib/ble/esp32-camera";
-import { CONTROL_UUID, INFO_UUID, SERVICE_UUID, STATUS_UUID } from "@/lib/ble/protocol";
+import { Esp32Camera, type PreviewFrame } from "@/lib/ble/esp32-camera";
+import { CONTROL_UUID, DATA_UUID, INFO_UUID, SERVICE_UUID, STATUS_UUID } from "@/lib/ble/protocol";
+import { framePackets } from "./ble-packets";
 
 // The Web Bluetooth setup client against a fake PlantCam that answers like firmware/esp32-cam/esp32-cam.ino.
 
@@ -43,6 +44,12 @@ class FakePlantCam extends EventTarget {
   readonly control = new FakeCharacteristic((t) => this.handle(t));
   readonly status = new FakeCharacteristic();
   readonly info = new FakeCharacteristic();
+  readonly data = new FakeCharacteristic();
+  /** Firmware 3.5+: a Data characteristic and "preview". */
+  hasPreview = true;
+  /** Send preview frames with a wrong CRC. */
+  damagePreview = false;
+  previewId = 0;
 
   readonly gatt = {
     connected: false,
@@ -58,13 +65,23 @@ class FakePlantCam extends EventTarget {
   };
 
   private readonly service = {
-    getCharacteristic: async (uuid: string) => ({ [CONTROL_UUID]: this.control, [STATUS_UUID]: this.status, [INFO_UUID]: this.info })[uuid],
+    getCharacteristic: async (uuid: string) => {
+      const chars: Record<string, FakeCharacteristic> = { [CONTROL_UUID]: this.control, [STATUS_UUID]: this.status, [INFO_UUID]: this.info };
+      if (this.hasPreview) chars[DATA_UUID] = this.data;
+      if (!chars[uuid]) throw new Error("No Characteristics matching UUID");
+      return chars[uuid];
+    },
   };
 
   constructor() {
     super();
     this.status.value = new DataView(text("ready").buffer);
     this.updateInfo();
+  }
+
+  /** The bytes of preview frame `n`. */
+  static frame(n: number): Uint8Array {
+    return Uint8Array.from({ length: 900 }, (_, i) => (i + n) % 256);
   }
 
   updateInfo() {
@@ -109,7 +126,14 @@ class FakePlantCam extends EventTarget {
       else if (v3 && name === "tg-chat") this.telegram.chat = value;
       else if (v3 && name === "tg-label") this.telegram.label = value;
       else if (v3 && name === "schedule") this.schedule = value;
-      else if (v3 && t === "report") {
+      else if (this.hasPreview && t === "preview") {
+        this.previewId++;
+        const jpeg = FakePlantCam.frame(this.previewId);
+        framePackets(jpeg, { frameId: this.previewId, crc: this.damagePreview ? 1 : undefined }).forEach((p, i) =>
+          setTimeout(() => this.connected && this.data.notify(new Uint8Array(p.buffer)), i),
+        );
+        return;
+      } else if (v3 && t === "report") {
         // Three photos, each taken and analyzed, then the result to Telegram.
         ["capturing", "analyzing", "capturing", "analyzing", "capturing", "analyzing"].forEach((s, i) => setTimeout(() => this.setStatus(s), i));
         setTimeout(() => (this.disconnectDuringReport ? this.gatt.disconnect() : this.setStatus("sending")), 7);
@@ -224,6 +248,45 @@ describe("test report", () => {
     device.disconnectDuringReport = true;
     await expect(camera.sendReport()).rejects.toThrow(/disconnected/);
     expect(camera.getSnapshot()).toMatchObject({ connection: "disconnected", busy: false });
+  });
+});
+
+describe("preview", () => {
+  it("shows frames until stopped, then frees the camera", async () => {
+    expect(camera.getSnapshot().canPreview).toBe(true);
+    const frames: PreviewFrame[] = [];
+    await camera.startPreview((f) => {
+      frames.push(f);
+      expect(camera.getSnapshot()).toMatchObject({ busy: true, previewing: true });
+      if (frames.length === 2) camera.stopPreview();
+    });
+    expect(device.commands).toEqual(["preview", "preview"]);
+    expect(frames.map((f) => [f.width, f.height])).toEqual([
+      [640, 480],
+      [640, 480],
+    ]);
+    expect(new Uint8Array(await frames[1].jpeg.arrayBuffer())).toEqual(FakePlantCam.frame(2));
+    expect(camera.getSnapshot()).toMatchObject({ busy: false, previewing: false });
+  });
+
+  it("keeps other commands out while it runs", async () => {
+    const preview = camera.startPreview(() => camera.stopPreview());
+    await expect(camera.sendReport()).rejects.toThrow(/busy/);
+    await preview;
+  });
+
+  it("gives up when the frames keep arriving damaged", async () => {
+    device.damagePreview = true;
+    await expect(camera.startPreview(() => {})).rejects.toThrow(/damaged/);
+    expect(device.commands).toEqual(["preview", "preview", "preview"]);
+    expect(camera.getSnapshot().previewing).toBe(false);
+  });
+
+  it("is not offered by firmware without it", async () => {
+    device.hasPreview = false;
+    await camera.connect();
+    expect(camera.getSnapshot().canPreview).toBe(false);
+    await expect(camera.startPreview(() => {})).rejects.toThrow(/no preview/);
   });
 });
 

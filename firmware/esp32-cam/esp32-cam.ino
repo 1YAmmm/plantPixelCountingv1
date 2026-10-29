@@ -33,12 +33,18 @@
 #include "mbedtls/platform.h"
 #include "vision.h"
 
-#define FIRMWARE_VERSION "3.4.0"
+#define FIRMWARE_VERSION "3.5.0"
 
 #define SERVICE_UUID "7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define CONTROL_UUID "7a1e0001-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define STATUS_UUID "7a1e0002-5c3b-4d2a-8f1e-3b9c6d4a2e10"
+#define DATA_UUID "7a1e0003-5c3b-4d2a-8f1e-3b9c6d4a2e10"
 #define INFO_UUID "7a1e0004-5c3b-4d2a-8f1e-3b9c6d4a2e10"
+
+// The preview on Data (lib/ble/protocol.ts parsePacket), little-endian:
+static const uint8_t PKT_START = 0x01;  // u32 size, u16 chunks, u32 crc32, u16 chunk size, u16 width, u16 height, u16 frame id
+static const uint8_t PKT_CHUNK = 0x02;  // u16 seq, payload
+static const uint8_t PKT_END = 0x03;    // u16 chunks, u16 frame id
 
 // AI-Thinker ESP32-CAM pins.
 #define PWDN_GPIO_NUM 32
@@ -64,6 +70,9 @@
 
 static const int JPEG_QUALITY = 12;                 // 10–63, lower is better quality and a bigger file
 static const framesize_t PHOTO_SIZE = FRAMESIZE_SXGA;  // 1280 × 1024: sharp enough for the 1000 px guide square
+static const framesize_t PREVIEW_SIZE = FRAMESIZE_VGA;  // the live view over BLE: about 20 KB a frame
+static const uint32_t PREVIEW_HOLD_MS = 10000;  // scheduled reports wait while someone watches the preview
+static const uint32_t SEND_TIMEOUT_MS = 3000;   // for room in the BLE controller's buffer
 
 static const uint32_t WIFI_ATTEMPT_MS = 12000;  // per attempt of "wifi:connect" (the web app waits 20 s per status)
 static const int WIFI_ATTEMPTS = 2;             // BLE shares the radio: the first scan sometimes misses the network
@@ -113,7 +122,13 @@ static QueueHandle_t commands = nullptr;
 static Preferences prefs;
 static char deviceName[20];
 
+static BLECharacteristic *dataChar = nullptr;
 static volatile bool connected = false;
+static volatile uint16_t connId = 0;
+static volatile bool notifyFailed = false;
+static framesize_t sensorSize = FRAMESIZE_INVALID;  // the frame size the sensor is set to
+static uint16_t previewId = 0;
+static uint32_t lastPreviewAt = 0;
 static bool cameraOk = false;       // found at boot
 static bool cameraRunning = false;  // the driver is started (stopped during uploads)
 static uint32_t cameraStartedAt = 0;
@@ -387,6 +402,7 @@ static esp_err_t startCamera() {
   }
   cameraRunning = true;
   cameraStartedAt = millis();
+  sensorSize = config.frame_size;
   return ESP_OK;
 }
 
@@ -400,6 +416,31 @@ static void stopCamera() {
 static void reportStatus(const String &status, bool quiet) {
   if (quiet) Serial.printf("[report] %s\n", status.c_str());
   else setStatus(status);
+}
+
+/** Set the sensor to `size` if it is not; returns whether it changed (then a few frames are stale). */
+static bool setFrameSize(framesize_t size) {
+  if (!psramFound() || sensorSize == size) return false;  // without PSRAM it stays VGA
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_framesize(s, size);
+  sensorSize = size;
+  return true;
+}
+
+/** Keep a copy of `fb` in `jpeg`. */
+static bool copyFrame(camera_fb_t *fb) {
+  if (fb->len > jpegCap) {
+    free(jpeg);
+    jpegCap = fb->len + 16 * 1024;
+    jpeg = (uint8_t *)(psramFound() ? ps_malloc(jpegCap) : malloc(jpegCap));
+  }
+  if (!jpeg) {
+    jpegCap = 0;
+    return false;
+  }
+  memcpy(jpeg, fb->buf, fb->len);
+  jpegLen = fb->len;
+  return true;
 }
 
 /** Take a fresh photo into `jpeg`. Returns false (with a status) if the camera failed. */
@@ -418,8 +459,10 @@ static bool takePhoto(bool quiet) {
     return false;
   }
   // Skip the frame waiting in the buffer (taken at the last request, maybe hours ago) and one more
-  // for the exposure; right after a start, keep skipping until the exposure has settled.
-  for (int i = 0; i < 2 || millis() - cameraStartedAt < CAMERA_SETTLE_MS; i++) {
+  // for the exposure, two more after the preview's frame size; right after a start, keep skipping
+  // until the exposure has settled.
+  int skip = setFrameSize(PHOTO_SIZE) ? 4 : 2;
+  for (int i = 0; i < skip || millis() - cameraStartedAt < CAMERA_SETTLE_MS; i++) {
     camera_fb_t *old = esp_camera_fb_get();
     if (old) esp_camera_fb_return(old);
   }
@@ -428,22 +471,108 @@ static bool takePhoto(bool quiet) {
     reportStatus("error:capture failed", quiet);
     return false;
   }
-  if (fb->len > jpegCap) {
-    free(jpeg);
-    jpegCap = fb->len + 16 * 1024;
-    jpeg = (uint8_t *)(psramFound() ? ps_malloc(jpegCap) : malloc(jpegCap));
-  }
-  if (!jpeg) {
-    jpegCap = 0;
-    esp_camera_fb_return(fb);
-    reportStatus("error:out of memory", quiet);
-    return false;
-  }
-  memcpy(jpeg, fb->buf, fb->len);
-  jpegLen = fb->len;
-  Serial.printf("[camera] %ux%u, %u bytes\n", fb->width, fb->height, (unsigned)jpegLen);
+  bool copied = copyFrame(fb);
+  Serial.printf("[camera] %ux%u, %u bytes\n", fb->width, fb->height, (unsigned)fb->len);
   esp_camera_fb_return(fb);
-  return true;
+  if (!copied) reportStatus("error:out of memory", quiet);
+  return copied;
+}
+
+// ---- Preview over BLE ----
+
+/** CRC-32 (IEEE 802.3, the zlib one), the same as crc32() in lib/ble/protocol.ts. */
+static uint32_t crc32(const uint8_t *data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
+  }
+  return ~crc;
+}
+
+static void putU16(uint8_t *p, uint16_t v) {
+  p[0] = v & 0xFF;
+  p[1] = v >> 8;
+}
+
+static void putU32(uint8_t *p, uint32_t v) {
+  putU16(p, v & 0xFFFF);
+  putU16(p + 2, v >> 16);
+}
+
+/** Notify one Data packet, waiting for room in the BLE controller's buffer. */
+static bool sendPacket(const uint8_t *data, size_t len) {
+  for (int attempt = 0; attempt < 5; attempt++) {
+    uint32_t start = millis();
+    while (esp_ble_get_cur_sendable_packets_num(connId) == 0) {
+      if (!connected || millis() - start > SEND_TIMEOUT_MS) return false;
+      vTaskDelay(1);
+    }
+    if (!connected) return false;
+    notifyFailed = false;
+    dataChar->setValue((uint8_t *)data, len);
+    dataChar->notify();
+    if (!notifyFailed) return true;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return false;
+}
+
+/**
+ * "preview": a small frame of the camera's view on Data, as START, CHUNK × n, END. No status
+ * unless it fails, so the live view stays fast; the frame stays in `jpeg` (serial "jpeg").
+ */
+static void sendPreview() {
+  lastPreviewAt = millis();
+  if (!cameraOk) return setStatus("error:camera not found, check the ribbon cable");
+  esp_err_t err = startCamera();
+  if (err != ESP_OK) {
+    if (err == ESP_ERR_NO_MEM) restartWhenIdle = true;
+    return setStatus("error:the camera did not start");
+  }
+  // Skip the frame waiting in the buffer, so the view is current (two more after a size change).
+  int skip = setFrameSize(PREVIEW_SIZE) ? 3 : 1;
+  for (int i = 0; i < skip; i++) {
+    camera_fb_t *old = esp_camera_fb_get();
+    if (old) esp_camera_fb_return(old);
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return setStatus("error:capture failed");
+  uint16_t width = fb->width, height = fb->height;
+  bool copied = copyFrame(fb);
+  esp_camera_fb_return(fb);
+  if (!copied) return setStatus("error:out of memory");
+
+  uint16_t mtu = server->getPeerMTU(connId);
+  uint16_t chunkSize = mtu > 6 + 20 ? mtu - 3 - 3 : 20;  // ATT header, then the chunk's own
+  uint16_t chunks = (jpegLen + chunkSize - 1) / chunkSize;
+  previewId++;
+  uint8_t packet[ESP_GATT_MAX_MTU_SIZE];
+  packet[0] = PKT_START;
+  putU32(packet + 1, jpegLen);
+  putU16(packet + 5, chunks);
+  putU32(packet + 7, crc32(jpeg, jpegLen));
+  putU16(packet + 11, chunkSize);
+  putU16(packet + 13, width);
+  putU16(packet + 15, height);
+  putU16(packet + 17, previewId);
+  bool ok = sendPacket(packet, 19);
+  for (uint16_t seq = 0; ok && seq < chunks; seq++) {
+    size_t offset = (size_t)seq * chunkSize;
+    size_t len = min((size_t)chunkSize, jpegLen - offset);
+    packet[0] = PKT_CHUNK;
+    putU16(packet + 1, seq);
+    memcpy(packet + 3, jpeg + offset, len);
+    ok = sendPacket(packet, len + 3);
+  }
+  if (ok) {
+    packet[0] = PKT_END;
+    putU16(packet + 1, chunks);
+    putU16(packet + 3, previewId);
+    ok = sendPacket(packet, 5);
+  }
+  if (!ok && connected) setStatus("error:the preview could not be sent");
+  lastPreviewAt = millis();
 }
 
 // ---- Telegram Bot API over HTTPS ----
@@ -832,6 +961,7 @@ static void markHandled(uint32_t slot) {
 /** Called from loop(): send the report when a scheduled time is due, once per time. */
 static void serviceSchedule() {
   if (!schedDays || !clockValid()) return;
+  if (connected && millis() - lastPreviewAt < PREVIEW_HOLD_MS) return;  // sent once the preview stops
   int64_t now = localMinutes();
   uint32_t slot = latestSlot(now);
   if (skipPastSlots) {
@@ -970,7 +1100,8 @@ static void serviceClock() {
 // ---- BLE ----
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *, esp_ble_gatts_cb_param_t *) override {
+  void onConnect(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
+    connId = param->connect.conn_id;
     connected = true;
     Serial.println("[ble] connected");
   }
@@ -987,6 +1118,13 @@ class ControlCallbacks : public BLECharacteristicCallbacks {
     String value = c->getValue();
     strncpy(cmd.text, value.c_str(), sizeof(cmd.text) - 1);
     if (xQueueSend(commands, &cmd, 0) != pdTRUE) Serial.println("[ble] command queue full");
+  }
+};
+
+class DataCallbacks : public BLECharacteristicCallbacks {
+  // A notification the stack could not queue: sendPacket() waits and tries again.
+  void onStatus(BLECharacteristic *, Status s, uint32_t) override {
+    if (s != SUCCESS_NOTIFY && s != SUCCESS_INDICATE) notifyFailed = true;
   }
 };
 
@@ -1037,6 +1175,8 @@ static void handleCommand(const char *text) {
     if (!saveSchedule(text + 9)) return setStatus("error:the schedule must look like 62,07:00,480");
     updateInfo();
     setStatus("ready");
+  } else if (strcmp(text, "preview") == 0) {
+    sendPreview();
   } else if (strcmp(text, "report") == 0) {
     sendReport(false, "Test report", true);
   } else {
@@ -1081,11 +1221,14 @@ void setup() {
   server->setCallbacks(new ServerCallbacks());
   server->advertiseOnDisconnect(true);
 
-  BLEService *service = server->createService(BLEUUID(SERVICE_UUID), 12);
+  BLEService *service = server->createService(BLEUUID(SERVICE_UUID), 16);
   BLECharacteristic *control = service->createCharacteristic(CONTROL_UUID, BLECharacteristic::PROPERTY_WRITE);
   control->setCallbacks(new ControlCallbacks());
   statusChar = service->createCharacteristic(STATUS_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   statusChar->addDescriptor(new BLE2902());
+  dataChar = service->createCharacteristic(DATA_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  dataChar->addDescriptor(new BLE2902());
+  dataChar->setCallbacks(new DataCallbacks());
   infoChar = service->createCharacteristic(INFO_UUID, BLECharacteristic::PROPERTY_READ);
   updateInfo();
   statusChar->setValue(cameraOk ? "ready" : "error:camera not found, check the ribbon cable");

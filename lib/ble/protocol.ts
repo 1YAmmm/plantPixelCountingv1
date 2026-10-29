@@ -8,14 +8,21 @@
 //                      "schedule:<days>,<HH:MM>,<UTC offset in minutes>"   days: bit 0 = Sunday … bit 6 = Saturday, 0 = off
 //                      "schedule:every:<minutes>,<UTC offset in minutes>"   round the clock (firmware 3.3)
 //                      "report"   take the photos, analyze them and send the result to Telegram now
+//                      "preview"  one small frame of the camera's view on Data (firmware 3.5)
 //   Status  (notify) "ready" | "connecting" | "capturing" | "analyzing" | "sending" | "error:<message>"
+//   Data    (notify) the preview frame as START, CHUNK × n, END packets (see parsePacket)
 //   Info    (read)   JSON: firmware version, WiFi, Telegram and schedule (see parseInfo)
 // No DOM or Next.js dependencies, so it is tested directly.
 
 export const SERVICE_UUID = "7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10";
 export const CONTROL_UUID = "7a1e0001-5c3b-4d2a-8f1e-3b9c6d4a2e10";
 export const STATUS_UUID = "7a1e0002-5c3b-4d2a-8f1e-3b9c6d4a2e10";
+export const DATA_UUID = "7a1e0003-5c3b-4d2a-8f1e-3b9c6d4a2e10";
 export const INFO_UUID = "7a1e0004-5c3b-4d2a-8f1e-3b9c6d4a2e10";
+
+export const PACKET_START = 0x01;
+export const PACKET_CHUNK = 0x02;
+export const PACKET_END = 0x03;
 
 /** The firmware advertises as PlantCam-XXXX (last bytes of its Bluetooth address). */
 export const DEVICE_NAME_PREFIX = "PlantCam";
@@ -63,7 +70,111 @@ export const command = {
     everyMinutes ? `schedule:every:${everyMinutes},${Math.round(utcOffset)}` : `schedule:${daysMask(days)},${time},${Math.round(utcOffset)}`,
   /** Photos, analysis and Telegram report now; answers "capturing" and "analyzing" (per photo), "sending", then "ready". */
   report: "report",
+  /** One preview frame on Data; no status unless it fails. */
+  preview: "preview",
 };
+
+export interface StartPacket {
+  type: "start";
+  /** JPEG size, bytes. */
+  size: number;
+  chunkCount: number;
+  crc: number;
+  width: number;
+  height: number;
+  frameId: number;
+}
+
+export interface ChunkPacket {
+  type: "chunk";
+  seq: number;
+  payload: Uint8Array;
+}
+
+export interface EndPacket {
+  type: "end";
+  chunkCount: number;
+  frameId: number;
+}
+
+export type DataPacket = StartPacket | ChunkPacket | EndPacket;
+
+/** Parse one Data notification (little-endian). Returns null for a packet this version does not know. */
+export function parsePacket(view: DataView): DataPacket | null {
+  if (view.byteLength < 1) return null;
+  const type = view.getUint8(0);
+  if (type === PACKET_START && view.byteLength >= 19) {
+    return {
+      type: "start",
+      size: view.getUint32(1, true),
+      chunkCount: view.getUint16(5, true),
+      crc: view.getUint32(7, true),
+      // bytes 11–12: the chunk size, not needed to put the frame together
+      width: view.getUint16(13, true),
+      height: view.getUint16(15, true),
+      frameId: view.getUint16(17, true),
+    };
+  }
+  if (type === PACKET_CHUNK && view.byteLength >= 3) {
+    // Copy: the browser may reuse the notification's buffer.
+    const payload = new Uint8Array(view.buffer, view.byteOffset + 3, view.byteLength - 3).slice();
+    return { type: "chunk", seq: view.getUint16(1, true), payload };
+  }
+  if (type === PACKET_END && view.byteLength >= 5) {
+    return { type: "end", chunkCount: view.getUint16(1, true), frameId: view.getUint16(3, true) };
+  }
+  return null;
+}
+
+/** Collects the chunks of one preview frame and rebuilds the JPEG. */
+export class FrameAssembler {
+  private readonly chunks: (Uint8Array | undefined)[];
+  private received = 0;
+
+  constructor(readonly start: StartPacket) {
+    this.chunks = new Array(start.chunkCount);
+  }
+
+  add(chunk: ChunkPacket): void {
+    if (chunk.seq >= this.chunks.length || this.chunks[chunk.seq]) return;
+    this.chunks[chunk.seq] = chunk.payload;
+    this.received++;
+  }
+
+  get complete(): boolean {
+    return this.received === this.chunks.length;
+  }
+
+  /** The JPEG, or null if a chunk is missing or the size or CRC-32 does not match. */
+  assemble(): Uint8Array<ArrayBuffer> | null {
+    if (!this.complete) return null;
+    const out = new Uint8Array(this.start.size);
+    let offset = 0;
+    for (const chunk of this.chunks as Uint8Array[]) {
+      if (offset + chunk.length > out.length) return null;
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return offset === out.length && crc32(out) === this.start.crc ? out : null;
+  }
+}
+
+let crcTable: Uint32Array | null = null;
+
+/** CRC-32 (IEEE 802.3, the zlib one), as computed by the firmware. */
+export function crc32(bytes: Uint8Array): number {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
 
 /** "127,07:00,480" or "every:30,480" (the Info "schedule" value) → schedule; null when off or unreadable. */
 export function parseSchedule(text: string): DeviceSchedule | null {

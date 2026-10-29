@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { esp32Camera } from "@/lib/ble/esp32-camera";
 import { firmwareAtLeast, firmwareMajor, INTERVAL_FIRMWARE, TELEGRAM_FIRMWARE, type DeviceStatus } from "@/lib/ble/protocol";
 import { describeSchedule, formatUtcOffset } from "@/lib/schedule";
+import { CameraPreview } from "./camera-preview";
 import { ScheduleStep } from "./schedule-step";
 import { cameraError, errorMessage, StepRow, useCamera, useMounted } from "./shared";
 import { TelegramStep } from "./telegram-step";
@@ -164,6 +165,8 @@ export function CameraSetup() {
             </AlertDescription>
           </Alert>
         )}
+
+        {info.camera && cam.canPreview && <CameraPreview />}
 
         <ol className="space-y-5">
           <StepRow
