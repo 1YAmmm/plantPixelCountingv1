@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: { default: "Plant Pixel Counter", template: "%s · Plant Pixel Counter" },
-  description: "Measures a plant's visible leaf cover from a photo by counting green pixels inside an on-screen guide square.",
+  description: "Sets up the PlantCam: its WiFi and the Telegram chat that gets its plant reports.",
   applicationName: "Plant Pixel Counter",
 };
 

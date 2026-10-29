@@ -1,14 +1,14 @@
-import { Analyzer } from "@/components/analyzer/analyzer";
 import { PageHeader } from "@/components/page-header";
+import { CameraSetup } from "@/components/setup/camera-setup";
 
-export default function AnalyzePage() {
+export default function SetupPage() {
   return (
     <>
       <PageHeader
-        title="Analyze a plant"
-        description="Frame the plant in the square, with the phone held flat or the ESP32-CAM mounted above it. Green pixels are counted as leaf cover of the square."
+        title="Set up the plant camera"
+        description="Put the PlantCam on WiFi and choose the Telegram chat for its reports. After that the camera takes the photo, analyzes it and sends the report by itself."
       />
-      <Analyzer />
+      <CameraSetup />
     </>
   );
 }

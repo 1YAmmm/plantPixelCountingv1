@@ -2,7 +2,10 @@
 
 Measures how much of a guide square a plant's leaves cover by counting green pixels, and compares
 it with the plant's own healthy baseline to detect wilting. Built from `plan.md` (§5–§6), trimmed
-to the UI and the pixel counting: **no login, no database, no printed marker**.
+to the UI and the pixel counting: **no login, no database, no printed marker**. The one exception
+is the [daily email report](#daily-email-report) (`newplan.md`): the ESP32-CAM photographs the
+plant on a schedule over WiFi and the server emails the results, so that part keeps a little state
+on the server.
 
 ## Run it
 
@@ -43,7 +46,8 @@ iPhone use the Bluefy browser. See [ESP32-CAM over Bluetooth](#esp32-cam-over-bl
    preview. Everything else is under **Advanced settings**.
 
 Settings and baseline samples are kept in the browser's localStorage. Export/Import (under
-Advanced settings) moves settings between devices.
+Advanced settings) moves settings between devices. The daily email report is the exception: it is
+saved on the server, with a copy of these settings.
 
 ## Pipeline (plan §5, with the guide square instead of the marker)
 
@@ -75,6 +79,7 @@ exactly like a phone photo (centre guide square, same pipeline). No WiFi is need
 ### Flash the firmware
 
 The sketch is `firmware/esp32-cam/esp32-cam.ino` (ESP32 Arduino core 3.x, no extra libraries).
+Version 2.0 adds WiFi for the daily email report; BLE works as before.
 
 - **Arduino IDE:** board **AI Thinker ESP32-CAM**, partition scheme **Huge APP** (the default),
   then Upload. With an ESP32-CAM-MB (USB) board the reset/boot is automatic.
@@ -86,7 +91,12 @@ The sketch is `firmware/esp32-cam/esp32-cam.ino` (ESP32 Arduino core 3.x, no ext
   ```
 
 The serial monitor (115200 baud) shows `[camera] ok, PSRAM yes` and
-`[ble] advertising as PlantCam-XXXX`.
+`[ble] advertising as PlantCam-XXXX`, then `[wifi] …` and a `[poll] ok` line every minute once
+the daily report is set up.
+
+BLE, WiFi and the PSRAM fix together nearly fill the ESP32's instruction RAM (IRAM): v2.0 uses
+about 125 of 128 KB. That is why it talks HTTP with a small built-in client instead of the core's
+`HTTPClient`, which would add 6 KB of date functions. Keep an eye on IRAM when adding libraries.
 
 ### Use it
 
@@ -112,10 +122,10 @@ One GATT service, `7a1e0000-5c3b-4d2a-8f1e-3b9c6d4a2e10` (UUIDs in `lib/ble/prot
 
 | Characteristic | Type | Content |
 |---|---|---|
-| Control `…0001` | write | `capture`, `preview`, `frame:<VGA…UXGA>`, `led:<0–255>`, `resend:<from>:<count>`, `info` |
-| Status `…0002` | read, notify | `ready` / `capturing` / `sending` / `error:<message>` |
+| Control `…0001` | write | `capture`, `preview`, `frame:<VGA…UXGA>`, `led:<0–255>`, `resend:<from>:<count>`, `info`; for the daily report `wifi-ssid:<name>`, `wifi-pass:<password>`, `server:<url>`, `key:<device key>`, `wifi:connect`, `wifi:forget` (up to 199 bytes) |
+| Status `…0002` | read, notify | `ready` / `capturing` / `sending` / `connecting` / `error:<message>` (`wifi:connect` fails with `wrong password`, `network not found` or `timeout`) |
 | Data `…0003` | notify | START (size, chunk count, CRC-32, chunk size, width, height), CHUNK (sequence number + up to MTU − 6 bytes), END |
-| Info `…0004` | read | JSON: firmware version, frame size, LED level, PSRAM |
+| Info `…0004` | read | JSON: firmware version, frame size, LED level, PSRAM, WiFi (joined, name, IP, signal), whether a server is set |
 
 `preview` sends a QVGA frame the same way but without status updates; the browser requests the
 next one as soon as a frame arrives. The preview and every photo size share the sensor's full
@@ -124,6 +134,64 @@ the photo's. The browser asks again for lost chunks (`resend`), checks the CRC-3
 photo once if it still arrives damaged. Browser side: `lib/ble/esp32-camera.ts` (Web Bluetooth client) and
 `components/analyzer/esp32-capture.tsx`. `tests/ble-*.test.ts` cover the wire format, the
 reassembly and the client against a simulated board, and check the firmware's UUIDs.
+
+## Daily email report
+
+`newplan.md`. The ESP32-CAM takes a photo by itself on the days and at the time set on the
+Settings page, the server analyzes it like an ESP32-CAM photo from the Analyze page (same guide
+square, same pipeline, compared with the ESP32-CAM baseline) and emails the status, the numbers,
+the photo and the overlay to everyone on the list.
+
+```
+ESP32-CAM (WiFi) --every 60 s--> GET  /api/device/config      "anything to do?"
+                 <-------------- poll=60 [capture=<slot>]       (only when a set time is due)
+ESP32-CAM -- JPEG -------------> POST /api/device/captures    (X-Slot: <slot>)
+                                   crop guide square → pipeline → status vs baseline
+                                   → Gmail to all recipients → summary for the Settings page
+```
+
+The server keeps the schedule, so the camera needs no clock and changes apply at its next poll.
+A photo missed at the set time (camera offline) is still taken if the camera is back within 3
+hours, and the email says it was late. Each set time is photographed and emailed once, even if the
+camera retries the upload.
+
+### Set it up
+
+1. Set the environment variables below (in `.env.local` for local use, in Vercel for the deployed
+   site) and flash firmware 2.0.
+2. **Settings → Daily email report**, sign in with `ADMIN_PASSWORD`, then three steps in order:
+   1. **Camera WiFi**, over Bluetooth, near the camera (2.4 GHz WiFi only). Skipped when the
+      server already hears from the camera. The step is done when the camera checks in.
+   2. **Email recipients**, up to 20. **Send test email** checks Gmail and the spam folders.
+   3. **When**: **Every day** or some days, and the time (in this device's time zone). **Start
+      daily report** also copies this browser's leaf colours, thresholds and ESP32-CAM baseline
+      to the server; **Copy again** appears when they change.
+3. **Take test photo now** runs the whole chain within about a minute.
+
+The photo uses the frame size and LED level last set on the Analyze page; set them once for the
+light at that hour. Without an ESP32-CAM baseline the status is "Unknown" (the numbers are still
+sent). The camera needs a steady 5 V 2 A supply: WiFi bursts reset it on weak ones.
+
+Local testing: run `npm run dev -- -H 0.0.0.0` (plain HTTP, which the camera can reach), open
+`http://localhost:3000/settings` in Chrome on the computer (Web Bluetooth works on localhost) and,
+in step 1 under **Advanced**, set the server to `http://<this computer's LAN IP>:3000`.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `ADMIN_PASSWORD` | Protects the Daily email report card (recipients, schedule, test buttons) |
+| `DEVICE_API_KEY` | A long random string; the camera sends it with every request (set during WiFi setup) |
+| `GMAIL_USER`, `GMAIL_APP_PASSWORD` | The Gmail account that sends the reports, and an [App Password](https://myaccount.google.com/apppasswords) for it (needs 2-step verification) |
+| `KV_REST_API_URL`, `KV_REST_API_TOKEN` | Upstash Redis (Vercel → Storage → Upstash Redis adds them; `UPSTASH_REDIS_REST_*` also work) |
+
+Without the Redis variables the server keeps its state in `.data/automation.json` (local
+development and tests). Without the Gmail variables, development saves each email as a `.eml` file
+in `.data/emails/`; production reports the error on the card.
+
+Code: `lib/automation/` (schedule, report and email content, shared types), `lib/server/` (storage,
+auth, Gmail), `app/api/device/*` (the camera), `app/api/automation/*` (the Settings card),
+`components/settings/daily-report.tsx`. Tests: `tests/automation-*.test.ts`, `tests/device-api.test.ts`.
 
 ## Tests
 
@@ -138,8 +206,8 @@ the backdrop, rejection of blurry/dark/bright photos, and processing time (< 2 s
 
 ## Not included (from plan.md)
 
-Accounts, database, plant history and charts, email alerts, reminders, ESP32 over WiFi (scheduled
-captures) and WiFi provisioning over BLE, QR labels
+Accounts, database, plant history and charts, alert rules and reminders (the daily email report
+above sends every result, not only problems), QR labels
 and the printed marker card (cm² measurement). The detection rules that need history
 (confirmation retake, rolling baseline, midday rule) are therefore not implemented; the
 baseline comparison above is the browser-only subset.

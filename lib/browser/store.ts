@@ -1,6 +1,7 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
+import { BASELINE_SAMPLES } from "../detection/baseline";
 import { DEFAULT_DETECTION_SETTINGS, parseDetectionSettings, type DetectionSettings } from "../detection/settings";
 import { DEFAULT_VISION_SETTINGS, parseVisionSettings, type VisionSettings } from "../vision/settings";
 
@@ -81,8 +82,7 @@ export interface BaselineState {
   samples: BaselineSample[];
 }
 
-/** Plan §6.1: the baseline is the average of 3 healthy calibration photos. */
-export const BASELINE_SAMPLES = 3;
+export { BASELINE_SAMPLES };
 
 /** Samples saved by older versions (without coverPct) are dropped. */
 function parseBaseline(raw: unknown): BaselineState {

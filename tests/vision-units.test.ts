@@ -1,7 +1,9 @@
+import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { hueInRange, rgbToHsv } from "@/lib/vision/color";
 import { convexHull, dilateSquare, fillConvexPolygon, maskHull, rectGap } from "@/lib/vision/geometry";
-import { guideRect } from "@/lib/vision/guide";
+import { guideRect, SQUARE_PX } from "@/lib/vision/guide";
+import { cropGuideSquare } from "@/lib/vision/node";
 import { buildRoiMask } from "@/lib/vision/roi";
 import { DEFAULT_VISION_SETTINGS, mergeDefaults, parseVisionSettings } from "@/lib/vision/settings";
 import { computeWhiteBalance } from "@/lib/vision/white-balance";
@@ -46,6 +48,67 @@ describe("guideRect", () => {
     const r = guideRect(900, 1600);
     expect(r.width * 900).toBeCloseTo(720, 6);
     expect(r.height * 1600).toBeCloseTo(720, 6);
+  });
+});
+
+describe("cropGuideSquare", () => {
+  /** A width × height JPEG: red outside the guide square, white inside, blue corners and a black centre dot inside it. */
+  async function markedPhoto(width: number, height: number, orientation?: number) {
+    const r = guideRect(width, height);
+    const [left, top, side] = [r.x * width, r.y * height, r.width * width];
+    const data = Buffer.alloc(width * height * 3);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const u = (x - left) / side;
+        const v = (y - top) / side;
+        const inside = u >= 0 && u < 1 && v >= 0 && v < 1;
+        const corner = inside && (u < 0.05 || u > 0.95) && (v < 0.05 || v > 0.95);
+        const centre = inside && Math.abs(u - 0.5) < 0.03 && Math.abs(v - 0.5) < 0.03;
+        const c = !inside ? [220, 30, 30] : corner ? [30, 30, 220] : centre ? [0, 0, 0] : [240, 240, 240];
+        data.set(c, (y * width + x) * 3);
+      }
+    }
+    let img = sharp(data, { raw: { width, height, channels: 3 } });
+    // Stored rotated, with the EXIF tag that turns it upright again.
+    if (orientation === 6) img = img.rotate(-90).withMetadata({ orientation: 6 });
+    return img.jpeg({ quality: 95 }).toBuffer();
+  }
+
+  async function pixel(jpeg: Buffer, x: number, y: number) {
+    const { data, info } = await sharp(jpeg).raw().toBuffer({ resolveWithObject: true });
+    const p = (y * info.width + x) * info.channels;
+    return [data[p], data[p + 1], data[p + 2]];
+  }
+
+  it.each([
+    [1600, 1200, undefined],
+    [1280, 1024, undefined],
+    [1200, 1600, 6],
+  ])("crops the guide square of a %i × %i photo (EXIF %s) to the analyzed size", async (width, height, orientation) => {
+    const out = await cropGuideSquare(await markedPhoto(width, height, orientation));
+    const meta = await sharp(out).metadata();
+    expect([meta.width, meta.height]).toEqual([SQUARE_PX, SQUARE_PX]);
+    for (const [x, y] of [
+      [10, 10],
+      [990, 10],
+      [10, 990],
+      [990, 990],
+    ]) {
+      const [r, g, b] = await pixel(out, x, y);
+      expect(b).toBeGreaterThan(150);
+      expect(r).toBeLessThan(90);
+      expect(g).toBeLessThan(90);
+    }
+    expect(Math.max(...(await pixel(out, 500, 500)))).toBeLessThan(60);
+    // Just inside the edges: the guide square's white, none of the red outside it.
+    for (const [x, y] of [
+      [500, 3],
+      [500, 996],
+      [3, 500],
+      [996, 500],
+    ]) {
+      expect(Math.min(...(await pixel(out, x, y)))).toBeGreaterThan(180);
+    }
   });
 });
 

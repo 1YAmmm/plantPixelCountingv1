@@ -1,15 +1,8 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Esp32Camera } from "@/lib/ble/esp32-camera";
-import { CONTROL_UUID, crc32, DATA_UUID, INFO_UUID, PACKET_CHUNK, PACKET_END, PACKET_START, SERVICE_UUID, STATUS_UUID } from "@/lib/ble/protocol";
+import { CONTROL_UUID, INFO_UUID, SERVICE_UUID, STATUS_UUID } from "@/lib/ble/protocol";
 
-// The Web Bluetooth client against a fake ESP32-CAM that answers like firmware/esp32-cam/esp32-cam.ino.
-
-const jpeg = new Uint8Array(readFileSync(path.join(import.meta.dirname, "../test-images/synthetic/rosette-healthy.jpg")));
-/** Stands in for a QVGA preview frame (the client only checks size and CRC). */
-const previewJpeg = jpeg.slice(0, 5000);
-const CHUNK = 244;
+// The Web Bluetooth setup client against a fake PlantCam that answers like firmware/esp32-cam/esp32-cam.ino.
 
 class FakeCharacteristic extends EventTarget {
   value: DataView | null = null;
@@ -33,28 +26,22 @@ class FakeCharacteristic extends EventTarget {
 
 const text = (s: string) => new TextEncoder().encode(s);
 
-class FakeEsp32 extends EventTarget {
+class FakePlantCam extends EventTarget {
   readonly name = "PlantCam-627E";
   readonly commands: string[] = [];
-  /** Chunks not delivered on the next transfer (the client must ask for them again). */
-  drop = new Set<number>();
-  /** Flip a byte in the next transfer (the client must retake the photo). */
-  corruptNext = 0;
-  failCapture = false;
-  failPreview = false;
-  disconnectAfterChunks: number | null = null;
-  frame = "SXGA";
+  firmware = "3.0.0";
+  /** "wifi:connect" fails with a password of "wrong". */
+  wifi = { ssid: "", pass: "", joined: false };
+  telegram = { token: "", chat: "", label: "" };
+  schedule = "";
+  /** The status the "report" command ends with. */
+  reportResult = "ready";
+  /** Drop the link during the next "report". */
+  disconnectDuringReport = false;
   connected = false;
-  /** Set if a command other than resend arrived while a photo was still being sent. */
-  overlapped = false;
-  private sending = false;
-  /** The last photo, kept for resends like the firmware does. */
-  private image = jpeg;
-  private sendTimer: ReturnType<typeof setImmediate> | null = null;
 
   readonly control = new FakeCharacteristic((t) => this.handle(t));
   readonly status = new FakeCharacteristic();
-  readonly data = new FakeCharacteristic();
   readonly info = new FakeCharacteristic();
 
   readonly gatt = {
@@ -66,13 +53,12 @@ class FakeEsp32 extends EventTarget {
     disconnect: () => {
       if (!this.connected) return;
       this.connected = false;
-      if (this.sendTimer) clearImmediate(this.sendTimer);
       this.dispatchEvent(new Event("gattserverdisconnected"));
     },
   };
 
   private readonly service = {
-    getCharacteristic: async (uuid: string) => ({ [CONTROL_UUID]: this.control, [STATUS_UUID]: this.status, [DATA_UUID]: this.data, [INFO_UUID]: this.info })[uuid],
+    getCharacteristic: async (uuid: string) => ({ [CONTROL_UUID]: this.control, [STATUS_UUID]: this.status, [INFO_UUID]: this.info })[uuid],
   };
 
   constructor() {
@@ -81,98 +67,66 @@ class FakeEsp32 extends EventTarget {
     this.updateInfo();
   }
 
-  private updateInfo() {
-    this.info.value = new DataView(text(JSON.stringify({ fw: "1.0.0", model: "AI-Thinker ESP32-CAM", camera: true, frame: this.frame, led: 0, psram: true })).buffer);
+  updateInfo() {
+    const w = this.wifi;
+    const t = this.telegram;
+    const info = {
+      fw: this.firmware,
+      model: "AI-Thinker ESP32-CAM",
+      camera: true,
+      wifi: w.joined,
+      ssid: w.ssid,
+      ip: w.joined ? "192.168.1.23" : "",
+      telegram: !!(t.token && t.chat),
+      tgLabel: t.label,
+      schedule: this.schedule,
+      clock: w.joined,
+    };
+    this.info.value = new DataView(text(JSON.stringify(info)).buffer);
   }
 
   private setStatus(s: string) {
     this.status.notify(text(s));
   }
 
-  /** Packets go out one per task, like notifications arriving over the air (setImmediate: Windows timers tick at ~15 ms). */
-  private sendAll(packets: Uint8Array[], then: () => void) {
-    const next = (i: number) => {
-      if (!this.connected) return;
-      if (i === packets.length) return then();
-      // The transfer is over once the last packet is out; the client may answer it right away.
-      this.sending = i < packets.length - 1;
-      this.data.notify(packets[i]);
-      this.sendTimer = setImmediate(() => next(i + 1));
-    };
-    next(0);
-  }
-
-  private chunk(seq: number, corrupt = false) {
-    const payload = this.image.slice(seq * CHUNK, (seq + 1) * CHUNK);
-    if (corrupt) payload[0] ^= 0xff;
-    const p = new Uint8Array(3 + payload.length);
-    p[0] = PACKET_CHUNK;
-    new DataView(p.buffer).setUint16(1, seq, true);
-    p.set(payload, 3);
-    return p;
-  }
-
-  private end(count: number) {
-    const p = new Uint8Array(5);
-    p[0] = PACKET_END;
-    new DataView(p.buffer).setUint16(1, count, true);
-    return p;
-  }
-
   private handle(t: string) {
     this.commands.push(t);
-    if (this.sending && !t.startsWith("resend:")) this.overlapped = true;
     setTimeout(() => {
-      const preview = t === "preview";
-      if (t === "capture" || preview) {
-        // Like the firmware: a preview frame sends no status, only errors.
-        if (!preview) this.setStatus("capturing");
-        if (preview ? this.failPreview : this.failCapture) return this.setStatus("error:capture failed");
-        if (!preview) this.setStatus("sending");
-        this.image = preview ? previewJpeg : jpeg;
-        const count = Math.ceil(this.image.length / CHUNK);
-        const start = new Uint8Array(19);
-        const v = new DataView(start.buffer);
-        start[0] = PACKET_START;
-        v.setUint32(1, this.image.length, true);
-        v.setUint16(5, count, true);
-        v.setUint32(7, crc32(this.image), true);
-        v.setUint16(11, CHUNK, true);
-        v.setUint16(13, preview ? 320 : 1280, true);
-        v.setUint16(15, preview ? 240 : 1024, true);
-        const corrupt = this.corruptNext-- > 0;
-        const chunks: Uint8Array[] = [];
-        for (let seq = 0; seq < count; seq++) {
-          if (this.disconnectAfterChunks === seq) {
-            this.sendAll([start, ...chunks], () => this.gatt.disconnect());
-            return;
-          }
-          if (!this.drop.has(seq)) chunks.push(this.chunk(seq, corrupt && seq === 2));
-        }
-        this.drop.clear();
-        this.sendAll([start, ...chunks, this.end(count)], () => !preview && this.setStatus("ready"));
-      } else if (t.startsWith("resend:")) {
-        const [from, n] = t.slice(7).split(":").map(Number);
-        const count = Math.ceil(this.image.length / CHUNK);
-        this.setStatus("sending");
-        const chunks = Array.from({ length: Math.min(n, count - from) }, (_, i) => this.chunk(from + i));
-        this.sendAll([...chunks, this.end(count)], () => this.setStatus("ready"));
-      } else if (t.startsWith("frame:")) {
-        this.frame = t.slice(6);
-        this.updateInfo();
-        this.setStatus("ready");
-      } else {
-        this.setStatus("error:unknown command");
-      }
+      const [name, ...rest] = t.split(":");
+      const value = rest.join(":");
+      const v3 = this.firmware.startsWith("3");
+      if (name === "wifi-ssid") this.wifi.ssid = value;
+      else if (name === "wifi-pass") this.wifi.pass = value;
+      else if (t === "wifi:connect") {
+        this.setStatus("connecting");
+        setTimeout(() => {
+          this.wifi.joined = this.wifi.pass !== "wrong" && !!this.wifi.ssid;
+          this.updateInfo();
+          this.setStatus(this.wifi.joined ? "ready" : "error:wrong password");
+        }, 5);
+        return;
+      } else if (v3 && name === "tg-token") this.telegram.token = value;
+      else if (v3 && name === "tg-chat") this.telegram.chat = value;
+      else if (v3 && name === "tg-label") this.telegram.label = value;
+      else if (v3 && name === "schedule") this.schedule = value;
+      else if (v3 && t === "report") {
+        this.setStatus("capturing");
+        setTimeout(() => this.setStatus("analyzing"), 2);
+        setTimeout(() => (this.disconnectDuringReport ? this.gatt.disconnect() : this.setStatus("sending")), 4);
+        setTimeout(() => this.connected && this.setStatus(this.reportResult), 6);
+        return;
+      } else return this.setStatus("error:unknown command");
+      this.updateInfo();
+      this.setStatus("ready");
     }, 0);
   }
 }
 
-let device: FakeEsp32;
+let device: FakePlantCam;
 let camera: Esp32Camera;
 
 beforeEach(async () => {
-  device = new FakeEsp32();
+  device = new FakePlantCam();
   vi.stubGlobal("window", { isSecureContext: true });
   vi.stubGlobal("navigator", { bluetooth: { getAvailability: async () => true, requestDevice: async () => device } });
   camera = new Esp32Camera();
@@ -183,120 +137,92 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function bytesOf(blob: Blob) {
-  return new Uint8Array(await blob.arrayBuffer());
-}
-
-describe("Esp32Camera", () => {
+describe("connection", () => {
   it("connects and reads the device info and status", () => {
     const s = camera.getSnapshot();
     expect(s).toMatchObject({ supported: true, connection: "connected", deviceName: "PlantCam-627E", status: { state: "ready" }, busy: false });
-    expect(s.info).toMatchObject({ firmware: "1.0.0", frame: "SXGA", camera: true });
+    expect(s.info).toMatchObject({ firmware: "3.0.0", camera: true, wifi: false, telegram: false, schedule: null });
   });
 
-  it("receives a photo with progress", async () => {
-    const progress: number[] = [];
-    const photo = await camera.capture((p) => progress.push(p.received / p.total));
-    expect(await bytesOf(photo.blob)).toEqual(jpeg);
-    expect(photo).toMatchObject({ width: 1280, height: 1024 });
-    expect(progress.at(-1)).toBe(1);
-    expect(camera.getSnapshot().busy).toBe(false);
-    expect(device.commands).toEqual(["capture"]);
+  it("rereads the Info on refresh", async () => {
+    device.wifi = { ssid: "Farm WiFi", pass: "x", joined: true };
+    device.updateInfo();
+    await camera.refresh();
+    expect(camera.getSnapshot().info).toMatchObject({ wifi: true, ssid: "Farm WiFi", ip: "192.168.1.23", clock: true });
   });
 
-  it("asks again for lost chunks", async () => {
-    device.drop = new Set([0, 4, 5, 6, 30]);
-    const photo = await camera.capture();
-    expect(await bytesOf(photo.blob)).toEqual(jpeg);
-    expect(device.commands).toEqual(["capture", "resend:0:1", "resend:4:3", "resend:30:1"]);
-  });
-
-  it("retakes a photo that arrived damaged", async () => {
-    device.corruptNext = 1;
-    const photo = await camera.capture();
-    expect(await bytesOf(photo.blob)).toEqual(jpeg);
-    expect(device.commands).toEqual(["capture", "capture"]);
-  });
-
-  it("reports camera errors from the board", async () => {
-    device.failCapture = true;
-    await expect(camera.capture()).rejects.toThrow("ESP32-CAM: capture failed");
-    expect(camera.getSnapshot().busy).toBe(false);
-  });
-
-  it("changes the frame size and rereads the info", async () => {
-    await camera.setFrame("UXGA");
-    expect(device.commands).toEqual(["frame:UXGA"]);
-    expect(camera.getSnapshot().info?.frame).toBe("UXGA");
-  });
-
-  it("runs one command at a time", async () => {
-    const first = camera.capture();
-    await expect(camera.setFrame("VGA")).rejects.toThrow(/busy/);
-    await first;
-  });
-
-  it("fails the capture and reports the disconnect when the link drops", async () => {
-    device.disconnectAfterChunks = 10;
-    await expect(camera.capture()).rejects.toThrow(/disconnected/);
-    expect(camera.getSnapshot()).toMatchObject({ connection: "disconnected", deviceName: "PlantCam-627E", busy: false });
-
-    // Reconnect without the chooser, then capture normally.
-    device.disconnectAfterChunks = null;
+  it("reports the disconnect and reconnects without the chooser", async () => {
+    device.gatt.disconnect();
+    expect(camera.getSnapshot()).toMatchObject({ connection: "disconnected", deviceName: "PlantCam-627E" });
     await camera.connect();
     expect(camera.getSnapshot().connection).toBe("connected");
-    expect(await bytesOf((await camera.capture()).blob)).toEqual(jpeg);
   });
 });
 
-describe("live preview", () => {
-  afterEach(() => camera.stopPreview());
-
-  it("streams preview frames until stopped", async () => {
-    camera.startPreview();
-    await vi.waitFor(() => expect(device.commands.length).toBeGreaterThanOrEqual(3));
-    const s = camera.getSnapshot();
-    expect(s).toMatchObject({ previewing: true, previewFrame: { width: 320, height: 240 } });
-    expect(await bytesOf(s.previewFrame!.blob)).toEqual(previewJpeg);
-    await vi.waitFor(() => expect(camera.getSnapshot().previewFps).toBeGreaterThan(0));
-
-    camera.stopPreview();
-    await new Promise((r) => setTimeout(r, 50));
-    const sent = device.commands.length;
-    await new Promise((r) => setTimeout(r, 100));
-    expect(device.commands.length).toBe(sent);
-    expect(device.commands.every((c) => c === "preview")).toBe(true);
-    expect(camera.getSnapshot()).toMatchObject({ previewing: false, previewFps: null });
+describe("WiFi", () => {
+  it("sends the WiFi, joins it and returns the new Info", async () => {
+    const info = await camera.setupWifi({ ssid: "Farm WiFi", password: "pa:ss" });
+    expect(device.commands).toEqual(["wifi-ssid:Farm WiFi", "wifi-pass:pa:ss", "wifi:connect"]);
+    expect(device.wifi).toMatchObject({ ssid: "Farm WiFi", pass: "pa:ss" });
+    expect(info).toMatchObject({ wifi: true, ssid: "Farm WiFi", ip: "192.168.1.23" });
+    expect(camera.getSnapshot()).toMatchObject({ busy: false, info: { wifi: true } });
   });
 
-  it("pauses for a capture and a settings change, then resumes", async () => {
-    camera.startPreview();
-    await vi.waitFor(() => expect(device.commands.length).toBeGreaterThanOrEqual(2));
-    const photo = await camera.capture();
-    expect(await bytesOf(photo.blob)).toEqual(jpeg);
-    await camera.setFrame("UXGA");
-    await vi.waitFor(() => expect(device.commands.lastIndexOf("preview")).toBeGreaterThan(device.commands.indexOf("frame:UXGA")));
-    // The capture waited for the frame in flight: transfers never overlap.
-    expect(device.overlapped).toBe(false);
-    expect(device.commands.filter((c) => c !== "preview")).toEqual(["capture", "frame:UXGA"]);
+  it("reports the camera's reason when it cannot join", async () => {
+    await expect(camera.setupWifi({ ssid: "Farm WiFi", password: "wrong" })).rejects.toThrow("Camera: wrong password");
+    expect(camera.getSnapshot().busy).toBe(false);
   });
 
-  it("stops by itself after repeated failures", async () => {
-    device.failPreview = true;
-    camera.startPreview();
-    await vi.waitFor(() => expect(camera.getSnapshot().previewing).toBe(false));
-    expect(camera.getSnapshot().previewError).toBe("ESP32-CAM: capture failed");
-    expect(device.commands).toEqual(["preview", "preview", "preview"]);
+  it("refuses values longer than the firmware's command buffer", async () => {
+    await expect(camera.setupWifi({ ssid: "x", password: "p".repeat(200) })).rejects.toThrow(/too long/);
+    expect(device.commands).toEqual([]);
+  });
+});
+
+describe("Telegram and schedule", () => {
+  it("saves the bot token, chat and label", async () => {
+    const info = await camera.setupTelegram({ token: "123456:AAbbcc", chatId: -1001234567890, label: "Farm group via @plant_bot" });
+    expect(device.commands).toEqual(["tg-token:123456:AAbbcc", "tg-chat:-1001234567890", "tg-label:Farm group via @plant_bot"]);
+    expect(info).toMatchObject({ telegram: true, telegramLabel: "Farm group via @plant_bot" });
   });
 
-  it("ends with the connection and resumes after reconnecting", async () => {
-    camera.startPreview();
-    await vi.waitFor(() => expect(device.commands.length).toBeGreaterThanOrEqual(2));
-    camera.disconnect();
-    expect(camera.getSnapshot().connection).toBe("disconnected");
-    const sent = device.commands.length;
-    await camera.connect();
-    await vi.waitFor(() => expect(device.commands.length).toBeGreaterThan(sent));
-    expect(camera.getSnapshot().previewing).toBe(true);
+  it("saves the schedule", async () => {
+    const info = await camera.setSchedule({ days: [1, 2, 3, 4, 5], time: "07:30", utcOffset: 480 });
+    expect(device.commands).toEqual(["schedule:62,07:30,480"]);
+    expect(info?.schedule).toEqual({ days: [1, 2, 3, 4, 5], time: "07:30", utcOffset: 480 });
+  });
+
+  it("fails clearly on firmware without Telegram", async () => {
+    device.firmware = "2.0.0";
+    await expect(camera.setupTelegram({ token: "123456:AAbbcc", chatId: 42, label: "Ana" })).rejects.toThrow("Camera: unknown command");
+    expect(device.commands).toEqual(["tg-token:123456:AAbbcc"]);
+  });
+});
+
+describe("test report", () => {
+  it("follows the camera through photo, analysis and upload", async () => {
+    const states: string[] = [];
+    camera.subscribe(() => states.push(camera.getSnapshot().status?.state ?? ""));
+    await camera.sendReport();
+    expect(device.commands).toEqual(["report"]);
+    expect(states.filter((s, i) => s !== states[i - 1])).toEqual(expect.arrayContaining(["capturing", "analyzing", "sending", "ready"]));
+    expect(camera.getSnapshot().busy).toBe(false);
+  });
+
+  it("passes on the camera's error", async () => {
+    device.reportResult = "error:Telegram refused the photo";
+    await expect(camera.sendReport()).rejects.toThrow("Camera: Telegram refused the photo");
+  });
+
+  it("runs one command at a time", async () => {
+    const report = camera.sendReport();
+    await expect(camera.setSchedule({ days: [0], time: "07:00", utcOffset: 0 })).rejects.toThrow(/busy/);
+    await report;
+  });
+
+  it("fails when the link drops", async () => {
+    device.disconnectDuringReport = true;
+    await expect(camera.sendReport()).rejects.toThrow(/disconnected/);
+    expect(camera.getSnapshot()).toMatchObject({ connection: "disconnected", busy: false });
   });
 });

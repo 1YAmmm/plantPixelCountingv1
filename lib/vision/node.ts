@@ -1,5 +1,6 @@
 import sharp from "sharp";
 import { analyzeImage, type Analysis, type AnalyzeOptions } from "./analyze";
+import { guideRect, SQUARE_PX } from "./guide";
 import { renderOverlay } from "./overlay";
 import type { RgbImage } from "./types";
 
@@ -33,6 +34,26 @@ export async function prepareImage(input: Buffer, maxLongEdge: number | null): P
   }
   const jpeg = await pipeline.jpeg({ quality: 90 }).toBuffer();
   return { jpeg, image: await decodeImage(jpeg) };
+}
+
+/**
+ * The centred guide square of a full camera photo, scaled to SQUARE_PX × SQUARE_PX: the server
+ * version of fileToSquare() in lib/browser/image.ts, for photos the ESP32-CAM uploads by itself, so
+ * they are framed exactly like the ones (and the baseline) taken over Bluetooth.
+ */
+export async function cropGuideSquare(input: Buffer): Promise<Buffer> {
+  const { autoOrient } = await sharp(input, { failOn: "error" }).metadata();
+  const { width, height } = autoOrient;
+  const r = guideRect(width, height);
+  const side = Math.max(1, Math.min(Math.floor(r.width * width), width, height));
+  const left = Math.min(width - side, Math.max(0, Math.round(r.x * width)));
+  const top = Math.min(height - side, Math.max(0, Math.round(r.y * height)));
+  return sharp(input, { failOn: "error" })
+    .autoOrient()
+    .extract({ left, top, width: side, height: side })
+    .resize(SQUARE_PX, SQUARE_PX)
+    .jpeg({ quality: 90 })
+    .toBuffer();
 }
 
 export interface PipelineResult {
